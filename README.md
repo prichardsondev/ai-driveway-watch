@@ -120,3 +120,6 @@ files from
 [Qengineering/YoloV8-ncnn-Raspberry-Pi-4](https://github.com/Qengineering/YoloV8-ncnn-Raspberry-Pi-4),
 which are covered by Qengineering’s BSD 3-Clause license. The installer also
 downloads that upstream license alongside the assets.
+
+See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) for the project’s human, AI, and
+open-source collaboration credits.
