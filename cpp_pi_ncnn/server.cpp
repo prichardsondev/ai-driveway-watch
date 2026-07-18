@@ -93,6 +93,7 @@ struct SharedState {
     std::mutex frame_mutex;
     cv::Mat latest_frame;
     std::vector<unsigned char> latest_jpeg;
+    std::vector<unsigned char> latest_clean_jpeg;
     unsigned long jpeg_generation = 0;
 
     std::mutex status_mutex;
@@ -117,6 +118,7 @@ struct SharedState {
 };
 
 SharedState state;
+std::atomic<unsigned int> clean_stream_clients{0};
 std::mutex events_mutex;
 std::mutex notification_mutex;
 std::condition_variable notification_ready;
@@ -876,14 +878,14 @@ h1,h2,p{margin:0}.live{display:flex;align-items:center;gap:8px;color:#a9f5cf}.do
 .video{position:relative;overflow:hidden;border:1px solid #315c4b;border-radius:18px;background:#020504;box-shadow:0 20px 70px #0008}.video img{display:block;width:100%;aspect-ratio:16/9;object-fit:contain}.boundary-canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair;touch-action:none}
 .panel{margin:18px 0;padding:20px;border:1px solid #29483d;border-radius:16px;background:#102219dd}.panel h2{font-size:1.1rem;margin-bottom:16px}
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.stat{padding:14px;border-radius:12px;background:#183126}.label{font-size:.78rem;color:#91b7a5;text-transform:uppercase;letter-spacing:.06em}.value{font-size:1.25rem;margin-top:5px}
-.tabs{display:flex;gap:8px;margin:18px 0}.tab{flex:1;padding:13px;border:1px solid #315c4b;border-radius:12px;background:#102219;color:#a9c7ba;font-weight:700;cursor:pointer}.tab.active{background:#24513d;color:#fff;border-color:#4d9a75}[hidden]{display:none!important}.events{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}.event{overflow:hidden;border-radius:12px;background:#183126}.event-image{display:block;width:100%;padding:0;border:0;background:#07100d;cursor:zoom-in}.event-image img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover}.meta{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px}.meta-text{min-width:0}.event strong{display:block;text-transform:capitalize}.event small{color:#91b7a5}.delete{display:grid;place-items:center;flex:0 0 42px;width:42px;height:42px;border:1px solid #70433f;border-radius:10px;background:#3b2422;color:#ffd4cf;font-size:1.15rem;cursor:pointer}.delete:hover{background:#60302c}.note{color:#a9c7ba;line-height:1.5}.boundary-summary{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:12px}.button{min-height:44px;padding:10px 15px;border:1px solid #4d9a75;border-radius:10px;background:#24513d;color:#fff;font-weight:700;cursor:pointer}.button.secondary{border-color:#527065;background:#183126}.button.danger{border-color:#70433f;background:#3b2422;color:#ffd4cf}.editor-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{display:grid;gap:7px;color:#a9c7ba;font-size:.85rem}.field select,.field input{width:100%;min-height:44px;padding:9px 11px;border:1px solid #527065;border-radius:10px;background:#07100d;color:#fff;font:inherit}.editor-tools,.editor-save{display:flex;flex-wrap:wrap;gap:9px;margin-top:14px}.editor-save{justify-content:flex-end;padding-top:14px;border-top:1px solid #29483d}.point-status{margin-top:12px;color:#a9f5cf}.save-status{min-height:1.5em;margin-top:10px}.save-status.error{color:#ffb3aa}.save-status.success{color:#a9f5cf}dialog.viewer{width:100vw;height:100vh;max-width:none;max-height:none;margin:0;padding:70px 18px 18px;border:0;background:#020504f2;color:#edf8f3}.viewer::backdrop{background:#000d}.viewer img{display:block;width:100%;height:calc(100vh - 110px);object-fit:contain}.viewer-bar{position:fixed;z-index:2;top:0;left:0;right:0;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px;background:#07100df2}.viewer-actions{display:flex;gap:8px}.viewer-close{display:grid;place-items:center;width:44px;height:44px;border:1px solid #527065;border-radius:10px;background:#183126;color:#fff;font-size:1.6rem;cursor:pointer}@media(max-width:720px){.stats{grid-template-columns:repeat(2,1fr)}.editor-grid{grid-template-columns:1fr}.boundary-summary{align-items:flex-start;flex-direction:column}.boundary-summary .button{width:100%}.editor-save .button{flex:1}}
+.tabs{display:flex;gap:8px;margin:18px 0}.tab{flex:1;padding:13px;border:1px solid #315c4b;border-radius:12px;background:#102219;color:#a9c7ba;font-weight:700;cursor:pointer}.tab.active{background:#24513d;color:#fff;border-color:#4d9a75}[hidden]{display:none!important}.events{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}.event{overflow:hidden;border-radius:12px;background:#183126}.event-image{display:block;width:100%;padding:0;border:0;background:#07100d;cursor:zoom-in}.event-image img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover}.meta{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px}.meta-text{min-width:0}.event strong{display:block;text-transform:capitalize}.event small{color:#91b7a5}.delete{display:grid;place-items:center;flex:0 0 42px;width:42px;height:42px;border:1px solid #70433f;border-radius:10px;background:#3b2422;color:#ffd4cf;font-size:1.15rem;cursor:pointer}.delete:hover{background:#60302c}.note{color:#a9c7ba;line-height:1.5}.boundary-summary{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:12px}.boundary-buttons{display:flex;gap:8px}.button{min-height:44px;padding:10px 15px;border:1px solid #4d9a75;border-radius:10px;background:#24513d;color:#fff;font-weight:700;cursor:pointer}.button.secondary{border-color:#527065;background:#183126}.button.danger{border-color:#70433f;background:#3b2422;color:#ffd4cf}.editor-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{display:grid;gap:7px;color:#a9c7ba;font-size:.85rem}.field select,.field input{width:100%;min-height:44px;padding:9px 11px;border:1px solid #527065;border-radius:10px;background:#07100d;color:#fff;font:inherit}.editor-tools,.editor-save{display:flex;flex-wrap:wrap;gap:9px;margin-top:14px}.editor-save{justify-content:flex-end;padding-top:14px;border-top:1px solid #29483d}.point-status{margin-top:12px;color:#a9f5cf}.save-status{min-height:1.5em;margin-top:10px}.save-status.error{color:#ffb3aa}.save-status.success{color:#a9f5cf}dialog.viewer{width:100vw;height:100vh;max-width:none;max-height:none;margin:0;padding:70px 18px 18px;border:0;background:#020504f2;color:#edf8f3}.viewer::backdrop{background:#000d}.viewer img{display:block;width:100%;height:calc(100vh - 110px);object-fit:contain}.viewer-bar{position:fixed;z-index:2;top:0;left:0;right:0;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px;background:#07100df2}.viewer-actions{display:flex;gap:8px}.viewer-close{display:grid;place-items:center;width:44px;height:44px;border:1px solid #527065;border-radius:10px;background:#183126;color:#fff;font-size:1.6rem;cursor:pointer}@media(max-width:720px){.stats{grid-template-columns:repeat(2,1fr)}.editor-grid{grid-template-columns:1fr}.boundary-summary{align-items:flex-start;flex-direction:column}.boundary-buttons{width:100%}.boundary-buttons .button{flex:1}.editor-save .button{flex:1}}
 </style>
 </head>
 <body>
 <header><h1>Driveway Watch</h1><div class="live"><span class="dot"></span><span id="health">Pi live</span></div></header>
 <main>
 <div class="video"><img id="live-stream" src="/stream.mjpg" alt="Live driveway camera from Raspberry Pi"><canvas class="boundary-canvas" id="boundary-canvas" hidden aria-label="Boundary drawing area"></canvas></div>
-<div class="boundary-summary"><p class="note">Blue: driveway arrival. Amber: mailbox stop. Purple: passing road traffic.</p><button class="button secondary" id="edit-boundaries" type="button">Edit boundaries</button></div>
+<div class="boundary-summary"><p class="note">Blue: driveway arrival. Amber: mailbox stop. Purple: passing road traffic.</p><div class="boundary-buttons"><button class="button secondary" id="toggle-boundaries" type="button">Hide boundaries</button><button class="button secondary" id="edit-boundaries" type="button">Edit boundaries</button></div></div>
 <section class="panel" id="boundary-editor" hidden>
 <h2>Boundary editor</h2>
 <p class="note">Choose a type, press “Redraw this boundary,” then tap around the area. Nothing changes until you save.</p>
@@ -919,6 +921,7 @@ const boundaryEditor=document.getElementById('boundary-editor');
 const boundaryCanvas=document.getElementById('boundary-canvas');
 const boundaryContext=boundaryCanvas.getContext('2d');
 const liveStream=document.getElementById('live-stream');
+const toggleBoundaries=document.getElementById('toggle-boundaries');
 const zoneType=document.getElementById('zone-type');
 const zoneLabel=document.getElementById('zone-label');
 const pointStatus=document.getElementById('point-status');
@@ -926,6 +929,9 @@ const boundaryStatus=document.getElementById('boundary-status');
 let baselineZones=[];
 let workingZones=[];
 let redrawing=false;
+let boundariesVisible=true;
+try{boundariesVisible=localStorage.getItem('driveway-boundaries-visible')!=='false';}catch(error){}
+function refreshStreamPreference(){toggleBoundaries.textContent=boundariesVisible?'Hide boundaries':'Show boundaries';toggleBoundaries.setAttribute('aria-pressed',String(!boundariesVisible));liveStream.src='/stream.mjpg?boundaries='+(boundariesVisible?'1':'0')+'&session='+Date.now();}
 function cloneZones(zones){return JSON.parse(JSON.stringify(zones));}
 function selectedZone(){return workingZones.find(zone=>zone.id===zoneType.value);}
 function resizeBoundaryCanvas(){const rectangle=liveStream.getBoundingClientRect();boundaryCanvas.width=Math.max(1,Math.round(rectangle.width));boundaryCanvas.height=Math.max(1,Math.round(rectangle.height));drawBoundaries();}
@@ -937,6 +943,7 @@ function zonePointsText(points){return points.map(point=>point.map(value=>value.
 async function saveBoundaries(){for(const zone of workingZones){if(zone.points.length<3){zoneType.value=zone.id;refreshZoneEditor();boundaryStatus.className='save-status error';boundaryStatus.textContent=zone.label+' needs at least 3 points before anything can be saved.';return;}}const form=new URLSearchParams();for(const zone of workingZones){form.set(zone.id+'_label',zone.label);form.set(zone.id+'_points',zonePointsText(zone.points));}boundaryStatus.className='save-status note';boundaryStatus.textContent='Saving…';try{const response=await fetch('/api/zones',{method:'PUT',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body:form.toString()});const data=await response.json();if(!response.ok)throw new Error(data.error||'save failed');baselineZones=cloneZones(data.zones);workingZones=cloneZones(data.zones);closeBoundaryEditor();const editButton=document.getElementById('edit-boundaries');editButton.textContent='Boundaries saved ✓';setTimeout(()=>{editButton.textContent='Edit boundaries';},2500);}catch(error){boundaryStatus.className='save-status error';boundaryStatus.textContent='Nothing changed: '+error.message;}}
 async function restoreBoundaries(){if(!confirm('Restore the original boundaries we calibrated? Your later boundary edits will be replaced.'))return;boundaryStatus.className='save-status note';boundaryStatus.textContent='Restoring original boundaries…';try{const response=await fetch('/api/zones/restore',{method:'POST'});const data=await response.json();if(!response.ok)throw new Error(data.error||'restore failed');baselineZones=cloneZones(data.zones);workingZones=cloneZones(data.zones);refreshZoneEditor();boundaryStatus.className='save-status success';boundaryStatus.textContent='Original boundaries restored and active.';}catch(error){boundaryStatus.className='save-status error';boundaryStatus.textContent='Nothing changed: '+error.message;}}
 document.getElementById('edit-boundaries').addEventListener('click',openBoundaryEditor);
+toggleBoundaries.addEventListener('click',()=>{boundariesVisible=!boundariesVisible;try{localStorage.setItem('driveway-boundaries-visible',String(boundariesVisible));}catch(error){}refreshStreamPreference();});
 document.getElementById('cancel-boundaries').addEventListener('click',closeBoundaryEditor);
 document.getElementById('save-boundaries').addEventListener('click',saveBoundaries);
 document.getElementById('restore-boundaries').addEventListener('click',restoreBoundaries);
@@ -968,7 +975,7 @@ function renderEvents(list,box,emptyText){box.replaceChildren();if(!list.length)
 async function updateEvents(){try{const responses=await Promise.all([fetch('/api/events',{cache:'no-store'}),fetch('/api/road-events',{cache:'no-store'})]);const lists=await Promise.all(responses.map(response=>response.json()));renderEvents(lists[0],document.getElementById('events'),'No driveway events yet');renderEvents(lists[1],document.getElementById('road-events'),'No passing vehicles captured yet');}catch(e){}}
 function selectArchive(road){document.getElementById('driveway-panel').hidden=road;document.getElementById('road-panel').hidden=!road;const drivewayTab=document.getElementById('driveway-tab');const roadTab=document.getElementById('road-tab');drivewayTab.classList.toggle('active',!road);roadTab.classList.toggle('active',road);drivewayTab.setAttribute('aria-selected',String(!road));roadTab.setAttribute('aria-selected',String(road));}
 document.getElementById('driveway-tab').addEventListener('click',()=>selectArchive(false));document.getElementById('road-tab').addEventListener('click',()=>selectArchive(true));
-update();updateEvents();setInterval(update,1000);setInterval(updateEvents,5000);
+refreshStreamPreference();update();updateEvents();setInterval(update,1000);setInterval(updateEvents,5000);
 </script>
 </body></html>)HTML";
 
@@ -1006,6 +1013,58 @@ const char* class_name(int label) {
         case 5: return "bus";
         case 7: return "truck";
         default: return "object";
+    }
+}
+
+void draw_zone_boundaries(cv::Mat& frame, const ZoneSettings& zones) {
+    std::vector<cv::Point> driveway_pixels;
+    driveway_pixels.reserve(zones.driveway.size());
+    for (const auto& point : zones.driveway) {
+        driveway_pixels.emplace_back(
+            static_cast<int>(point.x * frame.cols),
+            static_cast<int>(point.y * frame.rows));
+    }
+    cv::polylines(frame, std::vector<std::vector<cv::Point>>{driveway_pixels}, true,
+                  cv::Scalar(255, 190, 65), 2);
+    if (!driveway_pixels.empty()) {
+        cv::putText(frame, zones.driveway_label,
+                    driveway_pixels.front() + cv::Point(4, -6),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 190, 65), 2);
+    }
+
+    if (!zones.mailbox.empty()) {
+        std::vector<cv::Point> mailbox_pixels;
+        mailbox_pixels.reserve(zones.mailbox.size());
+        for (const auto& point : zones.mailbox) {
+            mailbox_pixels.emplace_back(
+                static_cast<int>(point.x * frame.cols),
+                static_cast<int>(point.y * frame.rows));
+        }
+        cv::polylines(frame, std::vector<std::vector<cv::Point>>{mailbox_pixels}, true,
+                      cv::Scalar(0, 185, 255), 2);
+        if (!mailbox_pixels.empty()) {
+            cv::putText(frame, zones.mailbox_label,
+                        mailbox_pixels.front() + cv::Point(4, -6),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 185, 255), 2);
+        }
+    }
+
+    if (!zones.road.empty()) {
+        std::vector<cv::Point> road_pixels;
+        road_pixels.reserve(zones.road.size());
+        for (const auto& point : zones.road) {
+            road_pixels.emplace_back(
+                static_cast<int>(point.x * frame.cols),
+                static_cast<int>(point.y * frame.rows));
+        }
+        cv::polylines(frame, std::vector<std::vector<cv::Point>>{road_pixels}, true,
+                      cv::Scalar(210, 80, 210), 2);
+        if (!road_pixels.empty()) {
+            cv::putText(frame, zones.road_label,
+                        road_pixels.front() + cv::Point(4, -6),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                        cv::Scalar(210, 80, 210), 2);
+        }
     }
 }
 
@@ -1112,56 +1171,6 @@ void inference_loop() {
                         config.nms_threshold);
         const double inference_ms =
             std::chrono::duration<double, std::milli>(Clock::now() - inference_start).count();
-
-        std::vector<cv::Point> zone_pixels;
-        zone_pixels.reserve(zones.driveway.size());
-        for (const auto& point : zones.driveway) {
-            zone_pixels.emplace_back(
-                static_cast<int>(point.x * frame.cols),
-                static_cast<int>(point.y * frame.rows));
-        }
-        cv::polylines(frame, std::vector<std::vector<cv::Point>>{zone_pixels}, true,
-                      cv::Scalar(255, 190, 65), 2);
-        if (!zone_pixels.empty()) {
-            cv::putText(frame, zones.driveway_label,
-                        zone_pixels.front() + cv::Point(4, -6),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 190, 65), 2);
-        }
-
-        if (!zones.mailbox.empty()) {
-            std::vector<cv::Point> mailbox_pixels;
-            mailbox_pixels.reserve(zones.mailbox.size());
-            for (const auto& point : zones.mailbox) {
-                mailbox_pixels.emplace_back(
-                    static_cast<int>(point.x * frame.cols),
-                    static_cast<int>(point.y * frame.rows));
-            }
-            cv::polylines(frame, std::vector<std::vector<cv::Point>>{mailbox_pixels}, true,
-                          cv::Scalar(0, 185, 255), 2);
-            if (!mailbox_pixels.empty()) {
-                cv::putText(frame, zones.mailbox_label,
-                            mailbox_pixels.front() + cv::Point(4, -6),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 185, 255), 2);
-            }
-        }
-
-        if (!zones.road.empty()) {
-            std::vector<cv::Point> road_pixels;
-            road_pixels.reserve(zones.road.size());
-            for (const auto& point : zones.road) {
-                road_pixels.emplace_back(
-                    static_cast<int>(point.x * frame.cols),
-                    static_cast<int>(point.y * frame.rows));
-            }
-            cv::polylines(frame, std::vector<std::vector<cv::Point>>{road_pixels}, true,
-                          cv::Scalar(210, 80, 210), 2);
-            if (!road_pixels.empty()) {
-                cv::putText(frame, zones.road_label,
-                            road_pixels.front() + cv::Point(4, -6),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.5,
-                            cv::Scalar(210, 80, 210), 2);
-            }
-        }
 
         int relevant_count = 0;
         double best_person_confidence = 0.0;
@@ -1366,11 +1375,19 @@ void inference_loop() {
             }
         }
 
+        std::vector<unsigned char> clean_jpeg;
+        if (clean_stream_clients.load() > 0) {
+            cv::imencode(".jpg", frame, clean_jpeg, jpeg_options);
+        }
+        cv::Mat annotated_frame;
+        frame.copyTo(annotated_frame);
+        draw_zone_boundaries(annotated_frame, zones);
         std::vector<unsigned char> jpeg;
-        cv::imencode(".jpg", frame, jpeg, jpeg_options);
+        cv::imencode(".jpg", annotated_frame, jpeg, jpeg_options);
         {
             std::lock_guard<std::mutex> lock(state.frame_mutex);
             state.latest_jpeg = std::move(jpeg);
+            state.latest_clean_jpeg = std::move(clean_jpeg);
             ++state.jpeg_generation;
         }
         {
@@ -1394,13 +1411,20 @@ void inference_loop() {
     }
 }
 
-void serve_mjpeg(int client_socket) {
+void serve_mjpeg(int client_socket, bool show_boundaries) {
+    const bool clean_stream = !show_boundaries;
+    if (clean_stream) {
+        clean_stream_clients.fetch_add(1);
+    }
     const std::string headers =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
         "Cache-Control: no-store\r\n"
         "Connection: close\r\n\r\n";
     if (!send_all(client_socket, headers.data(), headers.size())) {
+        if (clean_stream) {
+            clean_stream_clients.fetch_sub(1);
+        }
         return;
     }
 
@@ -1412,7 +1436,7 @@ void serve_mjpeg(int client_socket) {
             std::lock_guard<std::mutex> lock(state.frame_mutex);
             generation = state.jpeg_generation;
             if (generation != last_generation) {
-                jpeg = state.latest_jpeg;
+                jpeg = show_boundaries ? state.latest_jpeg : state.latest_clean_jpeg;
             }
         }
         if (jpeg.empty()) {
@@ -1430,6 +1454,9 @@ void serve_mjpeg(int client_socket) {
             break;
         }
         last_generation = generation;
+    }
+    if (clean_stream) {
+        clean_stream_clients.fetch_sub(1);
     }
 }
 
@@ -1512,6 +1539,12 @@ void handle_client(int client_socket) {
     std::string method;
     std::string path;
     request >> method >> path;
+    std::string query;
+    const std::size_t query_start = path.find('?');
+    if (query_start != std::string::npos) {
+        query = path.substr(query_start + 1);
+        path = path.substr(0, query_start);
+    }
 
     if (method == "PUT" && path == "/api/zones") {
         std::string error_message;
@@ -1560,7 +1593,7 @@ void handle_client(int client_socket) {
     } else if (path == "/api/zones") {
         send_text(client_socket, "application/json", zones_json());
     } else if (path == "/stream.mjpg") {
-        serve_mjpeg(client_socket);
+        serve_mjpeg(client_socket, query.find("boundaries=0") == std::string::npos);
     } else if (path.rfind("/events/", 0) == 0) {
         const std::string filename = path.substr(std::strlen("/events/"));
         serve_archived_image(client_socket, "events", filename);

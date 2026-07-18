@@ -29,6 +29,9 @@ kept as a draft until **Save changes** is pressed. **Cancel** discards the draft
 and **Restore original boundaries** always returns to the startup values from
 `.env`, so a field adjustment cannot permanently lose a known-good calibration.
 Saved edits live in `OUTPUT_DIR/zones.conf` and survive service restarts.
+Each phone or browser can independently hide the colored boundary lines. The
+display preference is stored only in that browser and never changes detection,
+alerts, or the saved zone configuration.
 
 `DETECTION_FPS` controls how often the detector examines a frame independently
 of the camera and dashboard stream rate. Start at `5`; a cooled Raspberry Pi 5
