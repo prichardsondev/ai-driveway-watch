@@ -15,4 +15,5 @@ cpp_pi_ncnn/LICENSE.qengineering
 *.jpg
 *.jpeg
 *.png
+!docs/images/driveway-watch-dashboard.jpg
 *.csv

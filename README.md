@@ -5,6 +5,8 @@ Raspberry Pi 5. It decodes one RTSP/RTSPS stream with OpenCV 5, runs YOLOv8n
 through Tencent NCNN, and serves a phone-friendly dashboard without sending
 video to a cloud vision service.
 
+![Driveway Watch dashboard with configurable detection zones](docs/images/driveway-watch-dashboard.jpg)
+
 ## What it does
 
 - driveway arrivals: person and vehicle snapshots with configurable cooldowns;
@@ -22,6 +24,21 @@ The colored polygons are configured as normalized `x,y` points:
 - blue: driveway arrival zone;
 - amber: mailbox stop zone;
 - purple: passing road-traffic zone.
+
+The dashboard also includes a touch-friendly boundary editor. Select a boundary
+type, give it a useful label, and tap the corners on the live image. Changes are
+kept as a draft until **Save changes** is pressed. **Cancel** discards the draft,
+and **Restore original boundaries** always returns to the startup values from
+`.env`, so a field adjustment cannot permanently lose a known-good calibration.
+Saved edits live in `OUTPUT_DIR/zones.conf` and survive service restarts.
+Each phone or browser can independently hide the colored boundary lines. The
+display preference is stored only in that browser and never changes detection,
+alerts, or the saved zone configuration.
+
+`DETECTION_FPS` controls how often the detector examines a frame independently
+of the camera and dashboard stream rate. Start at `5`; a cooled Raspberry Pi 5
+can often run `8` comfortably. Increase it only while inference time remains
+well below the frame interval and the Pi reports no thermal throttling.
 
 ## Hardware used for the reference build
 
@@ -84,7 +101,7 @@ This repository is intentionally prepared for coding agents:
 
 - [AGENTS.md](AGENTS.md) records invariants, privacy rules, and verification;
 - [architecture notes](docs/ARCHITECTURE.md) explain the event pipeline;
-- [roadmap](docs/ROADMAP.md) defines the interactive boundary editor;
+- [roadmap](docs/ROADMAP.md) tracks planned editor refinements and other features;
 - [agent prompts](prompts/README.md) provide safe starting tasks for
   calibration, missed detections, and notification integrations.
 
