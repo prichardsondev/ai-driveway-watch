@@ -49,6 +49,7 @@ struct ServiceConfig {
     double event_clear_seconds = 5.0;
     float confidence_threshold = 0.40f;
     float person_confidence_threshold = 0.25f;
+    float animal_confidence_threshold = 0.35f;
     float nms_threshold = 0.50f;
     double detection_fps = 5.0;
     std::filesystem::path output_dir = "runtime";
@@ -220,14 +221,26 @@ void send_ntfy(const EventInfo& event) {
         display_class.front() = static_cast<char>(std::toupper(display_class.front()));
     }
     const bool mailbox_event = event.class_name == "mailbox_vehicle";
+    const bool animal_event = event.class_name.rfind("animal_", 0) == 0;
+    std::string animal_name = animal_event ? event.class_name.substr(7) : "";
+    std::replace(animal_name.begin(), animal_name.end(), '_', ' ');
+    if (!animal_name.empty()) {
+        animal_name.front() = static_cast<char>(std::toupper(animal_name.front()));
+    }
     const std::string title = mailbox_event
         ? "Title: Driveway Watch — Mailbox"
-        : "Title: Driveway Watch — " + display_class;
+        : (animal_event ? "Title: Driveway Watch — Animal"
+                        : "Title: Driveway Watch — " + display_class);
     const std::string tags = mailbox_event ? "Tags: mailbox_with_mail"
-        : (event.class_name == "person" ? "Tags: bust_in_silhouette" : "Tags: car");
+        : (animal_event ? "Tags: paw_prints"
+                        : (event.class_name == "person"
+                               ? "Tags: bust_in_silhouette" : "Tags: car"));
     std::ostringstream body;
     if (mailbox_event) {
         body << "Vehicle stopped near the mailbox (";
+    } else if (animal_event) {
+        body << (animal_name.empty() ? "Animal" : animal_name)
+             << " detected inside a monitored boundary (";
     } else {
         body << display_class << " detected in the driveway (";
     }
@@ -905,9 +918,9 @@ h1,h2,p{margin:0}.live{display:flex;align-items:center;gap:8px;color:#a9f5cf}.do
 <div class="stat"><div class="label">Objects now</div><div class="value" id="objects">—</div></div>
 <div class="stat"><div class="label">Frames</div><div class="value" id="frames">—</div></div>
 </div></section>
-<div class="tabs" role="tablist" aria-label="Event archive"><button class="tab active" id="driveway-tab" type="button" role="tab" aria-selected="true">Driveway alerts (<span id="driveway-count">0</span>)</button><button class="tab" id="road-tab" type="button" role="tab" aria-selected="false">Road traffic (<span id="road-count">0</span>)</button></div>
-<div id="driveway-panel" role="tabpanel"><section class="panel"><h2>Recent driveway events</h2><div class="events" id="events"><p class="note">No events yet</p></div></section><section class="panel"><h2>Notifications</h2><p class="note" id="notifications">Checking phone alerts…</p></section></div>
-<div id="road-panel" role="tabpanel" hidden><section class="panel"><h2>Road traffic archive — no alerts</h2><p class="note" style="margin-bottom:16px">One snapshot is saved for each passing vehicle. These never send phone notifications.</p><div class="events" id="road-events"><p class="note">No passing vehicles captured yet</p></div></section></div>
+<div class="tabs" role="tablist" aria-label="Event archive"><button class="tab active" id="driveway-tab" type="button" role="tab" aria-selected="true">Alerts (<span id="driveway-count">0</span>)</button><button class="tab" id="road-tab" type="button" role="tab" aria-selected="false">Road traffic (<span id="road-count">0</span>)</button></div>
+<div id="driveway-panel" role="tabpanel"><section class="panel"><h2>Recent alerts</h2><div class="events" id="events"><p class="note">No alerts yet</p></div></section><section class="panel"><h2>Notifications</h2><p class="note" id="notifications">Checking phone alerts…</p></section></div>
+<div id="road-panel" role="tabpanel" hidden><section class="panel"><h2>Road traffic archive</h2><p class="note" style="margin-bottom:16px">Passing vehicle snapshots do not send alerts. Animals inside any boundary do.</p><div class="events" id="road-events"><p class="note">No passing vehicles captured yet</p></div></section></div>
 </main>
 <dialog class="viewer" id="viewer" aria-labelledby="viewer-caption">
 <div class="viewer-bar"><strong id="viewer-caption">Driveway event</strong><div class="viewer-actions"><button class="delete" id="viewer-delete" type="button" aria-label="Delete this event" title="Delete this event">🗑️</button><button class="viewer-close" id="viewer-close" type="button" aria-label="Close full-screen image">×</button></div></div>
@@ -973,16 +986,20 @@ if(!s.notification_enabled)n.textContent='Phone alerts are not configured.';
 else if(s.notification_error)n.textContent='Phone alerts need attention: '+s.notification_error;
 else n.textContent='ntfy phone alerts are active. '+s.notification_count+' event alert'+(s.notification_count===1?' has':'s have')+' been sent since this service started.';}catch(e){document.getElementById('health').textContent='Reconnecting';}}
 function renderEvents(list,box,emptyText){box.replaceChildren();if(!list.length){const p=document.createElement('p');p.className='note';p.textContent=emptyText;box.appendChild(p);return;}for(const event of list){const card=document.createElement('article');card.className='event';const imageButton=document.createElement('button');imageButton.className='event-image';imageButton.type='button';imageButton.setAttribute('aria-label','Open '+eventName(event)+' event full screen');const img=document.createElement('img');img.src=event.snapshot;img.alt=eventName(event)+' event';imageButton.appendChild(img);imageButton.addEventListener('click',()=>openEvent(event));const meta=document.createElement('div');meta.className='meta';const text=document.createElement('div');text.className='meta-text';const name=document.createElement('strong');name.textContent=eventName(event)+' — '+Math.round(event.confidence*100)+'%';const time=document.createElement('small');time.textContent=new Date(event.timestamp).toLocaleString();text.append(name,time);const remove=document.createElement('button');remove.className='delete';remove.type='button';remove.title='Delete this event';remove.setAttribute('aria-label','Delete '+eventName(event)+' event');remove.textContent='🗑️';remove.addEventListener('click',()=>deleteEvent(event));meta.append(text,remove);card.append(imageButton,meta);box.appendChild(card);}}
-async function updateEvents(){try{const responses=await Promise.all([fetch('/api/events',{cache:'no-store'}),fetch('/api/road-events',{cache:'no-store'})]);const lists=await Promise.all(responses.map(response=>response.json()));renderEvents(lists[0],document.getElementById('events'),'No driveway events yet');renderEvents(lists[1],document.getElementById('road-events'),'No passing vehicles captured yet');}catch(e){}}
+async function updateEvents(){try{const responses=await Promise.all([fetch('/api/events',{cache:'no-store'}),fetch('/api/road-events',{cache:'no-store'})]);const lists=await Promise.all(responses.map(response=>response.json()));renderEvents(lists[0],document.getElementById('events'),'No alerts yet');renderEvents(lists[1],document.getElementById('road-events'),'No passing vehicles captured yet');}catch(e){}}
 function selectArchive(road){document.getElementById('driveway-panel').hidden=road;document.getElementById('road-panel').hidden=!road;const drivewayTab=document.getElementById('driveway-tab');const roadTab=document.getElementById('road-tab');drivewayTab.classList.toggle('active',!road);roadTab.classList.toggle('active',road);drivewayTab.setAttribute('aria-selected',String(!road));roadTab.setAttribute('aria-selected',String(road));}
 document.getElementById('driveway-tab').addEventListener('click',()=>selectArchive(false));document.getElementById('road-tab').addEventListener('click',()=>selectArchive(true));
 refreshStreamPreference();update();updateEvents();setInterval(update,1000);setInterval(updateEvents,5000);
 </script>
 </body></html>)HTML";
 
+bool animal_class(int label) {
+    return label >= 14 && label <= 23;
+}
+
 bool relevant_class(int label) {
     return label == 0 || label == 1 || label == 2 || label == 3 ||
-           label == 5 || label == 7;
+           label == 5 || label == 7 || animal_class(label);
 }
 
 bool mailbox_vehicle_class(int label) {
@@ -1013,6 +1030,16 @@ const char* class_name(int label) {
         case 3: return "motorcycle";
         case 5: return "bus";
         case 7: return "truck";
+        case 14: return "bird";
+        case 15: return "cat";
+        case 16: return "dog";
+        case 17: return "horse";
+        case 18: return "sheep";
+        case 19: return "cow";
+        case 20: return "elephant";
+        case 21: return "bear";
+        case 22: return "zebra";
+        case 23: return "giraffe";
         default: return "object";
     }
 }
@@ -1199,8 +1226,9 @@ void inference_loop() {
         std::vector<Object> objects;
         const auto inference_start = Clock::now();
         detector.detect(frame, objects,
-                        std::min(config.confidence_threshold,
-                                 config.person_confidence_threshold),
+                        std::min({config.confidence_threshold,
+                                  config.person_confidence_threshold,
+                                  config.animal_confidence_threshold}),
                         config.nms_threshold);
         const double inference_ms =
             std::chrono::duration<double, std::milli>(Clock::now() - inference_start).count();
@@ -1222,33 +1250,61 @@ void inference_loop() {
             }
             const float required_confidence = object.label == 0
                 ? config.person_confidence_threshold
-                : config.confidence_threshold;
+                : (animal_class(object.label)
+                       ? config.animal_confidence_threshold
+                       : config.confidence_threshold);
             if (object.prob < required_confidence) {
                 continue;
             }
             const cv::Point2f zone_point(
                 (object.rect.x + object.rect.width * 0.5f) / frame.cols,
                 (object.rect.y + object.rect.height) / frame.rows);
-            const bool in_mailbox = mailbox_vehicle_class(object.label) &&
-                !zones.mailbox.empty() &&
+            const bool inside_driveway =
+                cv::pointPolygonTest(zones.driveway, zone_point, false) >= 0;
+            const bool inside_mailbox = !zones.mailbox.empty() &&
                 cv::pointPolygonTest(zones.mailbox, zone_point, false) >= 0;
+            const bool inside_road = !zones.road.empty() &&
+                cv::pointPolygonTest(zones.road, zone_point, false) >= 0;
+
+            if (animal_class(object.label)) {
+                if (!inside_driveway && !inside_mailbox && !inside_road) {
+                    continue;
+                }
+                ++relevant_count;
+                const auto existing = present_classes.find("animal");
+                if (existing == present_classes.end() ||
+                    existing->second->prob < object.prob) {
+                    present_classes["animal"] = &object;
+                }
+                const cv::Scalar color = inside_driveway
+                    ? cv::Scalar(65, 229, 141)
+                    : (inside_mailbox ? cv::Scalar(0, 185, 255)
+                                      : cv::Scalar(210, 80, 210));
+                const cv::Rect box = object.rect;
+                cv::rectangle(frame, box, color, 3);
+                std::ostringstream label;
+                label << "animal " << class_name(object.label) << " " << std::fixed
+                      << std::setprecision(0) << object.prob * 100.0f << "%";
+                cv::putText(frame, label.str(),
+                            cv::Point(box.x, std::max(24, box.y) - 7),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.65, color, 2);
+                continue;
+            }
+
+            const bool in_mailbox = mailbox_vehicle_class(object.label) && inside_mailbox;
             if (in_mailbox && (!mailbox_vehicle || mailbox_vehicle->prob < object.prob)) {
                 mailbox_vehicle = &object;
                 mailbox_vehicle_center = cv::Point2f(
                     (object.rect.x + object.rect.width * 0.5f) / frame.cols,
                     (object.rect.y + object.rect.height * 0.5f) / frame.rows);
             }
-            const bool in_road = road_vehicle_class(object.label) &&
-                !zones.road.empty() &&
-                cv::pointPolygonTest(zones.road, zone_point, false) >= 0;
+            const bool in_road = road_vehicle_class(object.label) && inside_road;
             if (in_road) {
                 road_detections.push_back({&object, cv::Point2f(
                     (object.rect.x + object.rect.width * 0.5f) / frame.cols,
                     (object.rect.y + object.rect.height * 0.5f) / frame.rows)});
             }
-            const bool in_driveway =
-                cv::pointPolygonTest(zones.driveway, zone_point, false) >= 0;
-            if (!in_driveway) {
+            if (!inside_driveway) {
                 if (in_mailbox || in_road) {
                     ++relevant_count;
                     const cv::Rect box = object.rect;
@@ -1396,7 +1452,10 @@ void inference_loop() {
                 continue;
             }
             last_event_by_class[name] = event_now;
-            EventInfo event = create_event(frame, name, object->prob, ++event_sequence);
+            const std::string event_name = name == "animal"
+                ? "animal_" + std::string(class_name(object->label)) : name;
+            EventInfo event = create_event(
+                frame, event_name, object->prob, ++event_sequence);
             queue_notification(event);
             {
                 std::lock_guard<std::mutex> lock(state.status_mutex);
@@ -1710,6 +1769,8 @@ int main(int argc, char** argv) {
         environment_number("CONFIDENCE_THRESHOLD", 0.40), 0.01, 0.99));
     config.person_confidence_threshold = static_cast<float>(std::clamp(
         environment_number("PERSON_CONFIDENCE_THRESHOLD", 0.25), 0.01, 0.99));
+    config.animal_confidence_threshold = static_cast<float>(std::clamp(
+        environment_number("ANIMAL_CONFIDENCE_THRESHOLD", 0.35), 0.01, 0.99));
     config.nms_threshold = static_cast<float>(std::clamp(
         environment_number("NMS_THRESHOLD", 0.50), 0.01, 0.99));
     config.detection_fps = std::clamp(

@@ -48,6 +48,8 @@ uses a 60-second per-class cooldown to suppress duplicate alerts. It writes:
 - the newest events to the dashboard at `http://PI_ADDRESS:8000/`.
 - optional text-only ntfy phone alerts for accepted events, using the same
   cooldown as the event log.
+- animal alerts from any configured boundary, grouped under one cooldown while
+  retaining the model's best supported species guess in the event name.
 - an optional amber mailbox zone that only records a vehicle after it remains
   nearly stationary for a configured dwell period.
 - full-screen event viewing and confirmed deletion of both the snapshot and its
@@ -62,10 +64,12 @@ private `.env` file and are not embedded in the executable or service unit.
 The ntfy topic is also stored only in that private file. Set `NTFY_SERVER` and
 `NTFY_TOPIC` to enable alerts; snapshots remain local to the Pi.
 
-Person detections use a 0.25 confidence threshold while vehicles retain the
-0.40 threshold. Zone entry is evaluated at the bottom-center of each box (the
-person's feet or vehicle's contact point), which is more appropriate for a
-driveway boundary than the box center.
+Person detections use a 0.25 confidence threshold, animals default to 0.35,
+and vehicles retain the 0.40 threshold. Zone entry is evaluated at the
+bottom-center of each box (the person's feet or object's contact point), which
+is more appropriate for a driveway boundary than the box center. The standard
+COCO model has no dedicated deer class, so deer may be reported as a similar
+supported animal or missed.
 
 Planned dashboard improvement: editable zone handles over the live image with
 Preview, Save, and Cancel controls, so the homeowner can redraw the boundary

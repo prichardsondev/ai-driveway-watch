@@ -11,10 +11,12 @@ video to a cloud vision service.
 
 - driveway arrivals: person and vehicle snapshots with configurable cooldowns;
 - mailbox stops: alerts only after a vehicle remains nearly stationary;
+- animals: one cooldown-controlled alert when a supported animal enters any
+  configured boundary;
 - road traffic: a separate, no-alert archive with one snapshot per tracked
   passing vehicle;
-- ntfy notifications: optional text-only phone alerts for driveway and mailbox
-  events;
+- ntfy notifications: optional text-only phone alerts for driveway, mailbox,
+  and animal events;
 - local dashboard: live video, full-screen event images, archive tabs, and
   confirmed deletion;
 - headless service: designed to restart automatically on a Raspberry Pi.
@@ -124,6 +126,9 @@ tests/         Python prototype tests
 - A random public ntfy topic is a bearer secret, not full authentication.
 - The service classifies common COCO objects; it does not identify people,
   license plates, or whether a vehicle truly belongs to a mail carrier.
+- The standard model recognizes bird, cat, dog, horse, sheep, cow, elephant,
+  bear, zebra, and giraffe. It has no dedicated deer class, so wildlife may be
+  reported as the closest supported animal or occasionally missed.
 - Mailbox alerts intentionally say “vehicle stopped near mailbox.”
 - Comply with local camera, audio, notice, and data-retention laws.
 
