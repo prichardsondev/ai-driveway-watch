@@ -994,7 +994,7 @@ refreshStreamPreference();update();updateEvents();setInterval(update,1000);setIn
 </body></html>)HTML";
 
 bool animal_class(int label) {
-    return (label >= 14 && label <= 19) || label == 21;
+    return label >= 14 && label <= 22;
 }
 
 bool relevant_class(int label) {

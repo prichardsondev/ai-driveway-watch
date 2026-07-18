@@ -69,8 +69,8 @@ and vehicles retain the 0.40 threshold. Zone entry is evaluated at the
 bottom-center of each box (the person's feet or object's contact point), which
 is more appropriate for a driveway boundary than the box center. The standard
 COCO model has no dedicated deer class, so deer may be reported as a similar
-supported animal or missed. Elephant, zebra, and giraffe detections are ignored
-because they produced implausible outdoor false positives in the reference view.
+supported animal or missed. Giraffe detections are ignored because that class
+produced a repeatable flag false positive in the reference view.
 
 Planned dashboard improvement: editable zone handles over the live image with
 Preview, Save, and Cancel controls, so the homeowner can redraw the boundary
