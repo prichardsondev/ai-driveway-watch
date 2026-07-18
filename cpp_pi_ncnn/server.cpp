@@ -62,6 +62,18 @@ struct ServiceConfig {
     double road_track_lost_seconds = 0.8;
     double road_track_match_distance = 0.20;
     std::size_t road_snapshot_retention = 100000;
+    std::string driveway_label = "Driveway arrival";
+    std::string mailbox_label = "Mailbox stop";
+    std::string road_label = "Road archive";
+};
+
+struct ZoneSettings {
+    std::vector<cv::Point2f> driveway;
+    std::vector<cv::Point2f> mailbox;
+    std::vector<cv::Point2f> road;
+    std::string driveway_label;
+    std::string mailbox_label;
+    std::string road_label;
 };
 
 struct EventInfo {
@@ -73,6 +85,8 @@ struct EventInfo {
 };
 
 ServiceConfig config;
+std::mutex zones_mutex;
+ZoneSettings default_zones;
 
 struct SharedState {
     std::mutex frame_mutex;
@@ -315,6 +329,264 @@ std::vector<cv::Point2f> parse_optional_zone(const char* value) {
     return points.size() >= 3 ? points : std::vector<cv::Point2f>{};
 }
 
+std::string clean_zone_label(const std::string& value, const std::string& fallback) {
+    std::string cleaned;
+    cleaned.reserve(std::min<std::size_t>(value.size(), 48));
+    for (const unsigned char character : value) {
+        if (character >= 32 && character != 127 && character != '\t' &&
+            character != '\r' && character != '\n') {
+            cleaned.push_back(static_cast<char>(character));
+            if (cleaned.size() == 48) {
+                break;
+            }
+        }
+    }
+    const auto first = cleaned.find_first_not_of(' ');
+    if (first == std::string::npos) {
+        return fallback;
+    }
+    const auto last = cleaned.find_last_not_of(' ');
+    return cleaned.substr(first, last - first + 1);
+}
+
+std::string zone_points_text(const std::vector<cv::Point2f>& points) {
+    std::ostringstream text;
+    text << std::fixed << std::setprecision(5);
+    for (std::size_t index = 0; index < points.size(); ++index) {
+        if (index) {
+            text << ';';
+        }
+        text << points[index].x << ',' << points[index].y;
+    }
+    return text.str();
+}
+
+bool same_zone(const std::vector<cv::Point2f>& left,
+               const std::vector<cv::Point2f>& right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        if (cv::norm(left[index] - right[index]) > 0.00001f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+ZoneSettings current_zones_locked() {
+    return {config.driveway_zone, config.mailbox_zone, config.road_zone,
+            config.driveway_label, config.mailbox_label, config.road_label};
+}
+
+void apply_zones_locked(const ZoneSettings& zones) {
+    config.driveway_zone = zones.driveway;
+    config.mailbox_zone = zones.mailbox;
+    config.road_zone = zones.road;
+    config.driveway_label = zones.driveway_label;
+    config.mailbox_label = zones.mailbox_label;
+    config.road_label = zones.road_label;
+}
+
+bool zones_are_default_locked() {
+    const ZoneSettings current = current_zones_locked();
+    return same_zone(current.driveway, default_zones.driveway) &&
+           same_zone(current.mailbox, default_zones.mailbox) &&
+           same_zone(current.road, default_zones.road) &&
+           current.driveway_label == default_zones.driveway_label &&
+           current.mailbox_label == default_zones.mailbox_label &&
+           current.road_label == default_zones.road_label;
+}
+
+bool save_zones_locked() {
+    const auto destination = config.output_dir / "zones.conf";
+    const auto temporary = config.output_dir / "zones.conf.tmp";
+    std::ofstream file(temporary, std::ios::trunc);
+    if (!file) {
+        return false;
+    }
+    const ZoneSettings zones = current_zones_locked();
+    file << "driveway\t" << zones.driveway_label << '\t'
+         << zone_points_text(zones.driveway) << '\n'
+         << "mailbox\t" << zones.mailbox_label << '\t'
+         << zone_points_text(zones.mailbox) << '\n'
+         << "road\t" << zones.road_label << '\t'
+         << zone_points_text(zones.road) << '\n';
+    file.close();
+    if (!file) {
+        return false;
+    }
+    std::error_code error;
+    std::filesystem::rename(temporary, destination, error);
+    if (!error) {
+        return true;
+    }
+    std::filesystem::remove(destination, error);
+    error.clear();
+    std::filesystem::rename(temporary, destination, error);
+    return !error;
+}
+
+void load_saved_zones() {
+    std::ifstream file(config.output_dir / "zones.conf");
+    if (!file) {
+        return;
+    }
+    ZoneSettings loaded = default_zones;
+    bool driveway_valid = false;
+    std::string line;
+    while (std::getline(file, line)) {
+        const std::size_t first_tab = line.find('\t');
+        const std::size_t second_tab = first_tab == std::string::npos
+            ? std::string::npos : line.find('\t', first_tab + 1);
+        if (first_tab == std::string::npos || second_tab == std::string::npos) {
+            continue;
+        }
+        const std::string id = line.substr(0, first_tab);
+        const std::string label = line.substr(first_tab + 1, second_tab - first_tab - 1);
+        const std::string points_text = line.substr(second_tab + 1);
+        const auto points = parse_optional_zone(points_text.c_str());
+        if (points.size() < 3) {
+            continue;
+        }
+        if (id == "driveway") {
+            loaded.driveway = points;
+            loaded.driveway_label = clean_zone_label(label, default_zones.driveway_label);
+            driveway_valid = true;
+        } else if (id == "mailbox") {
+            loaded.mailbox = points;
+            loaded.mailbox_label = clean_zone_label(label, default_zones.mailbox_label);
+        } else if (id == "road") {
+            loaded.road = points;
+            loaded.road_label = clean_zone_label(label, default_zones.road_label);
+        }
+    }
+    if (driveway_valid) {
+        std::lock_guard<std::mutex> lock(zones_mutex);
+        apply_zones_locked(loaded);
+    }
+}
+
+std::string zone_points_json(const std::vector<cv::Point2f>& points) {
+    std::ostringstream json;
+    json << std::fixed << std::setprecision(5) << '[';
+    for (std::size_t index = 0; index < points.size(); ++index) {
+        if (index) {
+            json << ',';
+        }
+        json << '[' << points[index].x << ',' << points[index].y << ']';
+    }
+    json << ']';
+    return json.str();
+}
+
+std::string zones_json() {
+    std::lock_guard<std::mutex> lock(zones_mutex);
+    const ZoneSettings zones = current_zones_locked();
+    std::ostringstream json;
+    json << "{\"customized\":" << (zones_are_default_locked() ? "false" : "true")
+         << ",\"zones\":["
+         << "{\"id\":\"driveway\",\"label\":\"" << json_escape(zones.driveway_label)
+         << "\",\"behavior\":\"Alerts for people and vehicles\",\"color\":\"#41bef7\",\"points\":"
+         << zone_points_json(zones.driveway) << "},"
+         << "{\"id\":\"mailbox\",\"label\":\"" << json_escape(zones.mailbox_label)
+         << "\",\"behavior\":\"Alerts when a vehicle stops\",\"color\":\"#ffb900\",\"points\":"
+         << zone_points_json(zones.mailbox) << "},"
+         << "{\"id\":\"road\",\"label\":\"" << json_escape(zones.road_label)
+         << "\",\"behavior\":\"Archives vehicles without alerts\",\"color\":\"#d250d2\",\"points\":"
+         << zone_points_json(zones.road) << "}]}";
+    return json.str();
+}
+
+int hex_value(char character) {
+    if (character >= '0' && character <= '9') return character - '0';
+    character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+    if (character >= 'a' && character <= 'f') return character - 'a' + 10;
+    return -1;
+}
+
+std::string url_decode(const std::string& value) {
+    std::string decoded;
+    decoded.reserve(value.size());
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        if (value[index] == '+') {
+            decoded.push_back(' ');
+        } else if (value[index] == '%' && index + 2 < value.size()) {
+            const int high = hex_value(value[index + 1]);
+            const int low = hex_value(value[index + 2]);
+            if (high >= 0 && low >= 0) {
+                decoded.push_back(static_cast<char>((high << 4) | low));
+                index += 2;
+            } else {
+                decoded.push_back(value[index]);
+            }
+        } else {
+            decoded.push_back(value[index]);
+        }
+    }
+    return decoded;
+}
+
+std::map<std::string, std::string> parse_form(const std::string& body) {
+    std::map<std::string, std::string> values;
+    std::istringstream fields(body);
+    std::string field;
+    while (std::getline(fields, field, '&')) {
+        const std::size_t equals = field.find('=');
+        if (equals != std::string::npos) {
+            values[url_decode(field.substr(0, equals))] =
+                url_decode(field.substr(equals + 1));
+        }
+    }
+    return values;
+}
+
+bool update_zones_from_form(const std::string& body, std::string& error_message) {
+    const auto values = parse_form(body);
+    const auto driveway_value = values.find("driveway_points");
+    const auto mailbox_value = values.find("mailbox_points");
+    const auto road_value = values.find("road_points");
+    if (driveway_value == values.end() || mailbox_value == values.end() ||
+        road_value == values.end()) {
+        error_message = "All three boundary types are required.";
+        return false;
+    }
+    const auto driveway = parse_optional_zone(driveway_value->second.c_str());
+    const auto mailbox = parse_optional_zone(mailbox_value->second.c_str());
+    const auto road = parse_optional_zone(road_value->second.c_str());
+    if (driveway.size() < 3 || mailbox.size() < 3 || road.size() < 3) {
+        error_message = "Each boundary needs at least three points.";
+        return false;
+    }
+    ZoneSettings updated{driveway, mailbox, road,
+        clean_zone_label(values.count("driveway_label") ? values.at("driveway_label") : "",
+                         "Driveway arrival"),
+        clean_zone_label(values.count("mailbox_label") ? values.at("mailbox_label") : "",
+                         "Mailbox stop"),
+        clean_zone_label(values.count("road_label") ? values.at("road_label") : "",
+                         "Road archive")};
+    std::lock_guard<std::mutex> lock(zones_mutex);
+    const ZoneSettings previous = current_zones_locked();
+    apply_zones_locked(updated);
+    if (!save_zones_locked()) {
+        apply_zones_locked(previous);
+        error_message = "The boundary file could not be saved.";
+        return false;
+    }
+    return true;
+}
+
+bool restore_default_zones() {
+    std::lock_guard<std::mutex> lock(zones_mutex);
+    const ZoneSettings previous = current_zones_locked();
+    apply_zones_locked(default_zones);
+    if (!save_zones_locked()) {
+        apply_zones_locked(previous);
+        return false;
+    }
+    return true;
+}
+
 std::string utc_timestamp(std::string* filename_timestamp = nullptr) {
     const std::time_t now = std::time(nullptr);
     std::tm utc{};
@@ -526,6 +798,11 @@ void load_existing_events() {
 }
 
 std::string status_json() {
+    bool mailbox_zone_enabled = false;
+    {
+        std::lock_guard<std::mutex> zone_lock(zones_mutex);
+        mailbox_zone_enabled = !config.mailbox_zone.empty();
+    }
     std::lock_guard<std::mutex> lock(state.status_mutex);
     std::ostringstream json;
     json << std::fixed << std::setprecision(1)
@@ -538,7 +815,7 @@ std::string status_json() {
          << ",\"relevant_objects\":" << state.relevant_objects
          << ",\"best_person_confidence\":" << state.best_person_confidence
          << ",\"person_in_zone\":" << (state.person_in_zone ? "true" : "false")
-         << ",\"mailbox_zone_enabled\":" << (config.mailbox_zone.empty() ? "false" : "true")
+         << ",\"mailbox_zone_enabled\":" << (mailbox_zone_enabled ? "true" : "false")
          << ",\"mailbox_vehicle_present\":" << (state.mailbox_vehicle_present ? "true" : "false")
          << ",\"mailbox_stationary_seconds\":" << state.mailbox_stationary_seconds
          << ",\"event_count\":" << state.event_count
@@ -595,17 +872,29 @@ const char* dashboard_html = R"HTML(<!doctype html>
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#17352a,#07100d 48%)}
 header,main{width:min(1120px,94vw);margin:auto}header{display:flex;align-items:center;justify-content:space-between;padding:24px 0 16px}
 h1,h2,p{margin:0}.live{display:flex;align-items:center;gap:8px;color:#a9f5cf}.dot{width:10px;height:10px;border-radius:50%;background:#40e58d;box-shadow:0 0 14px #40e58d}
-.video{overflow:hidden;border:1px solid #315c4b;border-radius:18px;background:#020504;box-shadow:0 20px 70px #0008}.video img{display:block;width:100%;aspect-ratio:16/9;object-fit:contain}
+.video{position:relative;overflow:hidden;border:1px solid #315c4b;border-radius:18px;background:#020504;box-shadow:0 20px 70px #0008}.video img{display:block;width:100%;aspect-ratio:16/9;object-fit:contain}.boundary-canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair;touch-action:none}
 .panel{margin:18px 0;padding:20px;border:1px solid #29483d;border-radius:16px;background:#102219dd}.panel h2{font-size:1.1rem;margin-bottom:16px}
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.stat{padding:14px;border-radius:12px;background:#183126}.label{font-size:.78rem;color:#91b7a5;text-transform:uppercase;letter-spacing:.06em}.value{font-size:1.25rem;margin-top:5px}
-.tabs{display:flex;gap:8px;margin:18px 0}.tab{flex:1;padding:13px;border:1px solid #315c4b;border-radius:12px;background:#102219;color:#a9c7ba;font-weight:700;cursor:pointer}.tab.active{background:#24513d;color:#fff;border-color:#4d9a75}[hidden]{display:none!important}.events{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}.event{overflow:hidden;border-radius:12px;background:#183126}.event-image{display:block;width:100%;padding:0;border:0;background:#07100d;cursor:zoom-in}.event-image img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover}.meta{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px}.meta-text{min-width:0}.event strong{display:block;text-transform:capitalize}.event small{color:#91b7a5}.delete{display:grid;place-items:center;flex:0 0 42px;width:42px;height:42px;border:1px solid #70433f;border-radius:10px;background:#3b2422;color:#ffd4cf;font-size:1.15rem;cursor:pointer}.delete:hover{background:#60302c}.note{color:#a9c7ba;line-height:1.5}dialog.viewer{width:100vw;height:100vh;max-width:none;max-height:none;margin:0;padding:70px 18px 18px;border:0;background:#020504f2;color:#edf8f3}.viewer::backdrop{background:#000d}.viewer img{display:block;width:100%;height:calc(100vh - 110px);object-fit:contain}.viewer-bar{position:fixed;z-index:2;top:0;left:0;right:0;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px;background:#07100df2}.viewer-actions{display:flex;gap:8px}.viewer-close{display:grid;place-items:center;width:44px;height:44px;border:1px solid #527065;border-radius:10px;background:#183126;color:#fff;font-size:1.6rem;cursor:pointer}@media(max-width:720px){.stats{grid-template-columns:repeat(2,1fr)}}
+.tabs{display:flex;gap:8px;margin:18px 0}.tab{flex:1;padding:13px;border:1px solid #315c4b;border-radius:12px;background:#102219;color:#a9c7ba;font-weight:700;cursor:pointer}.tab.active{background:#24513d;color:#fff;border-color:#4d9a75}[hidden]{display:none!important}.events{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}.event{overflow:hidden;border-radius:12px;background:#183126}.event-image{display:block;width:100%;padding:0;border:0;background:#07100d;cursor:zoom-in}.event-image img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover}.meta{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px}.meta-text{min-width:0}.event strong{display:block;text-transform:capitalize}.event small{color:#91b7a5}.delete{display:grid;place-items:center;flex:0 0 42px;width:42px;height:42px;border:1px solid #70433f;border-radius:10px;background:#3b2422;color:#ffd4cf;font-size:1.15rem;cursor:pointer}.delete:hover{background:#60302c}.note{color:#a9c7ba;line-height:1.5}.boundary-summary{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:12px}.button{min-height:44px;padding:10px 15px;border:1px solid #4d9a75;border-radius:10px;background:#24513d;color:#fff;font-weight:700;cursor:pointer}.button.secondary{border-color:#527065;background:#183126}.button.danger{border-color:#70433f;background:#3b2422;color:#ffd4cf}.editor-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{display:grid;gap:7px;color:#a9c7ba;font-size:.85rem}.field select,.field input{width:100%;min-height:44px;padding:9px 11px;border:1px solid #527065;border-radius:10px;background:#07100d;color:#fff;font:inherit}.editor-tools,.editor-save{display:flex;flex-wrap:wrap;gap:9px;margin-top:14px}.editor-save{justify-content:flex-end;padding-top:14px;border-top:1px solid #29483d}.point-status{margin-top:12px;color:#a9f5cf}.save-status{min-height:1.5em;margin-top:10px}.save-status.error{color:#ffb3aa}.save-status.success{color:#a9f5cf}dialog.viewer{width:100vw;height:100vh;max-width:none;max-height:none;margin:0;padding:70px 18px 18px;border:0;background:#020504f2;color:#edf8f3}.viewer::backdrop{background:#000d}.viewer img{display:block;width:100%;height:calc(100vh - 110px);object-fit:contain}.viewer-bar{position:fixed;z-index:2;top:0;left:0;right:0;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px;background:#07100df2}.viewer-actions{display:flex;gap:8px}.viewer-close{display:grid;place-items:center;width:44px;height:44px;border:1px solid #527065;border-radius:10px;background:#183126;color:#fff;font-size:1.6rem;cursor:pointer}@media(max-width:720px){.stats{grid-template-columns:repeat(2,1fr)}.editor-grid{grid-template-columns:1fr}.boundary-summary{align-items:flex-start;flex-direction:column}.boundary-summary .button{width:100%}.editor-save .button{flex:1}}
 </style>
 </head>
 <body>
 <header><h1>Driveway Watch</h1><div class="live"><span class="dot"></span><span id="health">Pi live</span></div></header>
 <main>
-<div class="video"><img src="/stream.mjpg" alt="Live driveway camera from Raspberry Pi"></div>
-<p class="note" style="margin-top:10px">Blue: driveway arrival zone. Amber: mailbox stop zone. Purple: passing road traffic.</p>
+<div class="video"><img id="live-stream" src="/stream.mjpg" alt="Live driveway camera from Raspberry Pi"><canvas class="boundary-canvas" id="boundary-canvas" hidden aria-label="Boundary drawing area"></canvas></div>
+<div class="boundary-summary"><p class="note">Blue: driveway arrival. Amber: mailbox stop. Purple: passing road traffic.</p><button class="button secondary" id="edit-boundaries" type="button">Edit boundaries</button></div>
+<section class="panel" id="boundary-editor" hidden>
+<h2>Boundary editor</h2>
+<p class="note">Choose a type, press “Redraw this boundary,” then tap around the area. Nothing changes until you save.</p>
+<div class="editor-grid" style="margin-top:14px">
+<label class="field">Boundary type<select id="zone-type"><option value="driveway">Driveway alert</option><option value="mailbox">Mailbox stop</option><option value="road">Road archive — no alert</option></select></label>
+<label class="field">Label shown on video<input id="zone-label" maxlength="48" autocomplete="off"></label>
+</div>
+<p class="point-status" id="point-status">Current boundary loaded</p>
+<div class="editor-tools"><button class="button secondary" id="redraw-zone" type="button">Redraw this boundary</button><button class="button secondary" id="undo-point" type="button">Undo point</button></div>
+<p class="save-status note" id="boundary-status" role="status"></p>
+<div class="editor-save"><button class="button danger" id="restore-boundaries" type="button">Restore original boundaries</button><button class="button secondary" id="cancel-boundaries" type="button">Cancel</button><button class="button" id="save-boundaries" type="button">Save changes</button></div>
+</section>
 <section class="panel"><h2>Raspberry Pi NCNN preview</h2><div class="stats">
 <div class="stat"><div class="label">Camera</div><div class="value" id="camera">—</div></div>
 <div class="stat"><div class="label">Detection</div><div class="value" id="inference">—</div></div>
@@ -625,6 +914,37 @@ let selectedEvent=null;
 const viewer=document.getElementById('viewer');
 const viewerImage=document.getElementById('viewer-image');
 const viewerCaption=document.getElementById('viewer-caption');
+const boundaryEditor=document.getElementById('boundary-editor');
+const boundaryCanvas=document.getElementById('boundary-canvas');
+const boundaryContext=boundaryCanvas.getContext('2d');
+const liveStream=document.getElementById('live-stream');
+const zoneType=document.getElementById('zone-type');
+const zoneLabel=document.getElementById('zone-label');
+const pointStatus=document.getElementById('point-status');
+const boundaryStatus=document.getElementById('boundary-status');
+let baselineZones=[];
+let workingZones=[];
+let redrawing=false;
+function cloneZones(zones){return JSON.parse(JSON.stringify(zones));}
+function selectedZone(){return workingZones.find(zone=>zone.id===zoneType.value);}
+function resizeBoundaryCanvas(){const rectangle=liveStream.getBoundingClientRect();boundaryCanvas.width=Math.max(1,Math.round(rectangle.width));boundaryCanvas.height=Math.max(1,Math.round(rectangle.height));drawBoundaries();}
+function drawBoundaries(){boundaryContext.clearRect(0,0,boundaryCanvas.width,boundaryCanvas.height);for(const zone of workingZones){if(!zone.points.length)continue;const selected=zone.id===zoneType.value;boundaryContext.beginPath();zone.points.forEach((point,index)=>{const x=point[0]*boundaryCanvas.width;const y=point[1]*boundaryCanvas.height;if(index===0)boundaryContext.moveTo(x,y);else boundaryContext.lineTo(x,y);});if(zone.points.length>=3)boundaryContext.closePath();boundaryContext.globalAlpha=selected ? .20 : .08;boundaryContext.fillStyle=zone.color;boundaryContext.fill();boundaryContext.globalAlpha=1;boundaryContext.strokeStyle=zone.color;boundaryContext.lineWidth=selected?4:2;boundaryContext.stroke();if(selected){for(const point of zone.points){boundaryContext.beginPath();boundaryContext.arc(point[0]*boundaryCanvas.width,point[1]*boundaryCanvas.height,7,0,Math.PI*2);boundaryContext.fillStyle=zone.color;boundaryContext.fill();boundaryContext.strokeStyle='#07100d';boundaryContext.lineWidth=2;boundaryContext.stroke();}}}}
+function refreshZoneEditor(){const zone=selectedZone();if(!zone)return;zoneLabel.value=zone.label;redrawing=false;pointStatus.textContent=zone.points.length+' points loaded. Press “Redraw this boundary” to replace it.';boundaryStatus.className='save-status note';boundaryStatus.textContent='';drawBoundaries();}
+async function openBoundaryEditor(){boundaryStatus.textContent='Loading boundaries…';try{const response=await fetch('/api/zones',{cache:'no-store'});if(!response.ok)throw new Error('load failed');const data=await response.json();baselineZones=cloneZones(data.zones);workingZones=cloneZones(data.zones);boundaryEditor.hidden=false;boundaryCanvas.hidden=false;zoneType.value='driveway';resizeBoundaryCanvas();refreshZoneEditor();boundaryEditor.scrollIntoView({behavior:'smooth',block:'nearest'});}catch(error){boundaryEditor.hidden=false;boundaryStatus.className='save-status error';boundaryStatus.textContent='The boundaries could not be loaded. No settings were changed.';}}
+function closeBoundaryEditor(){workingZones=cloneZones(baselineZones);boundaryEditor.hidden=true;boundaryCanvas.hidden=true;redrawing=false;boundaryStatus.textContent='';}
+function zonePointsText(points){return points.map(point=>point.map(value=>value.toFixed(5)).join(',')).join(';');}
+async function saveBoundaries(){for(const zone of workingZones){if(zone.points.length<3){zoneType.value=zone.id;refreshZoneEditor();boundaryStatus.className='save-status error';boundaryStatus.textContent=zone.label+' needs at least 3 points before anything can be saved.';return;}}const form=new URLSearchParams();for(const zone of workingZones){form.set(zone.id+'_label',zone.label);form.set(zone.id+'_points',zonePointsText(zone.points));}boundaryStatus.className='save-status note';boundaryStatus.textContent='Saving…';try{const response=await fetch('/api/zones',{method:'PUT',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body:form.toString()});const data=await response.json();if(!response.ok)throw new Error(data.error||'save failed');baselineZones=cloneZones(data.zones);workingZones=cloneZones(data.zones);closeBoundaryEditor();const editButton=document.getElementById('edit-boundaries');editButton.textContent='Boundaries saved ✓';setTimeout(()=>{editButton.textContent='Edit boundaries';},2500);}catch(error){boundaryStatus.className='save-status error';boundaryStatus.textContent='Nothing changed: '+error.message;}}
+async function restoreBoundaries(){if(!confirm('Restore the original boundaries we calibrated? Your later boundary edits will be replaced.'))return;boundaryStatus.className='save-status note';boundaryStatus.textContent='Restoring original boundaries…';try{const response=await fetch('/api/zones/restore',{method:'POST'});const data=await response.json();if(!response.ok)throw new Error(data.error||'restore failed');baselineZones=cloneZones(data.zones);workingZones=cloneZones(data.zones);refreshZoneEditor();boundaryStatus.className='save-status success';boundaryStatus.textContent='Original boundaries restored and active.';}catch(error){boundaryStatus.className='save-status error';boundaryStatus.textContent='Nothing changed: '+error.message;}}
+document.getElementById('edit-boundaries').addEventListener('click',openBoundaryEditor);
+document.getElementById('cancel-boundaries').addEventListener('click',closeBoundaryEditor);
+document.getElementById('save-boundaries').addEventListener('click',saveBoundaries);
+document.getElementById('restore-boundaries').addEventListener('click',restoreBoundaries);
+document.getElementById('redraw-zone').addEventListener('click',()=>{const zone=selectedZone();zone.points=[];redrawing=true;pointStatus.textContent='Tap at least 3 corners. Undo removes the last point.';boundaryStatus.textContent='';drawBoundaries();});
+document.getElementById('undo-point').addEventListener('click',()=>{const zone=selectedZone();if(redrawing&&zone.points.length){zone.points.pop();pointStatus.textContent=zone.points.length+' point'+(zone.points.length===1?'':'s')+' placed — at least 3 required.';drawBoundaries();}});
+zoneType.addEventListener('change',refreshZoneEditor);
+zoneLabel.addEventListener('input',()=>{const zone=selectedZone();if(zone)zone.label=zoneLabel.value;});
+boundaryCanvas.addEventListener('click',event=>{if(!redrawing)return;const rectangle=boundaryCanvas.getBoundingClientRect();const zone=selectedZone();zone.points.push([(event.clientX-rectangle.left)/rectangle.width,(event.clientY-rectangle.top)/rectangle.height]);pointStatus.textContent=zone.points.length+' point'+(zone.points.length===1?'':'s')+' placed'+(zone.points.length<3?' — at least 3 required.':' — ready to save or keep adding corners.');drawBoundaries();});
+window.addEventListener('resize',()=>{if(!boundaryCanvas.hidden)resizeBoundaryCanvas();});
 function eventName(event){return event.class_name.replaceAll('_',' ');}
 function openEvent(event){selectedEvent=event;viewerImage.src=event.snapshot;viewerCaption.textContent=eventName(event)+' — '+Math.round(event.confidence*100)+'%';viewer.showModal();}
 async function deleteEvent(event){if(!confirm('Delete this event image and its history entry? This cannot be undone.'))return;try{const response=await fetch(event.delete_path,{method:'DELETE'});if(!response.ok)throw new Error('delete failed');if(selectedEvent&&selectedEvent.id===event.id){viewer.close();selectedEvent=null;}await updateEvents();await update();}catch(error){alert('The event could not be deleted. Please try again.');}}
@@ -777,6 +1097,12 @@ void inference_loop() {
             continue;
         }
 
+        ZoneSettings zones;
+        {
+            std::lock_guard<std::mutex> lock(zones_mutex);
+            zones = current_zones_locked();
+        }
+
         std::vector<Object> objects;
         const auto inference_start = Clock::now();
         detector.detect(frame, objects,
@@ -787,19 +1113,24 @@ void inference_loop() {
             std::chrono::duration<double, std::milli>(Clock::now() - inference_start).count();
 
         std::vector<cv::Point> zone_pixels;
-        zone_pixels.reserve(config.driveway_zone.size());
-        for (const auto& point : config.driveway_zone) {
+        zone_pixels.reserve(zones.driveway.size());
+        for (const auto& point : zones.driveway) {
             zone_pixels.emplace_back(
                 static_cast<int>(point.x * frame.cols),
                 static_cast<int>(point.y * frame.rows));
         }
         cv::polylines(frame, std::vector<std::vector<cv::Point>>{zone_pixels}, true,
                       cv::Scalar(255, 190, 65), 2);
+        if (!zone_pixels.empty()) {
+            cv::putText(frame, zones.driveway_label,
+                        zone_pixels.front() + cv::Point(4, -6),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 190, 65), 2);
+        }
 
-        if (!config.mailbox_zone.empty()) {
+        if (!zones.mailbox.empty()) {
             std::vector<cv::Point> mailbox_pixels;
-            mailbox_pixels.reserve(config.mailbox_zone.size());
-            for (const auto& point : config.mailbox_zone) {
+            mailbox_pixels.reserve(zones.mailbox.size());
+            for (const auto& point : zones.mailbox) {
                 mailbox_pixels.emplace_back(
                     static_cast<int>(point.x * frame.cols),
                     static_cast<int>(point.y * frame.rows));
@@ -807,15 +1138,16 @@ void inference_loop() {
             cv::polylines(frame, std::vector<std::vector<cv::Point>>{mailbox_pixels}, true,
                           cv::Scalar(0, 185, 255), 2);
             if (!mailbox_pixels.empty()) {
-                cv::putText(frame, "MAILBOX STOP", mailbox_pixels.front() + cv::Point(4, -6),
+                cv::putText(frame, zones.mailbox_label,
+                            mailbox_pixels.front() + cv::Point(4, -6),
                             cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 185, 255), 2);
             }
         }
 
-        if (!config.road_zone.empty()) {
+        if (!zones.road.empty()) {
             std::vector<cv::Point> road_pixels;
-            road_pixels.reserve(config.road_zone.size());
-            for (const auto& point : config.road_zone) {
+            road_pixels.reserve(zones.road.size());
+            for (const auto& point : zones.road) {
                 road_pixels.emplace_back(
                     static_cast<int>(point.x * frame.cols),
                     static_cast<int>(point.y * frame.rows));
@@ -823,7 +1155,8 @@ void inference_loop() {
             cv::polylines(frame, std::vector<std::vector<cv::Point>>{road_pixels}, true,
                           cv::Scalar(210, 80, 210), 2);
             if (!road_pixels.empty()) {
-                cv::putText(frame, "ROAD ARCHIVE", road_pixels.front() + cv::Point(4, -6),
+                cv::putText(frame, zones.road_label,
+                            road_pixels.front() + cv::Point(4, -6),
                             cv::FONT_HERSHEY_SIMPLEX, 0.5,
                             cv::Scalar(210, 80, 210), 2);
             }
@@ -854,8 +1187,8 @@ void inference_loop() {
                 (object.rect.x + object.rect.width * 0.5f) / frame.cols,
                 (object.rect.y + object.rect.height) / frame.rows);
             const bool in_mailbox = mailbox_vehicle_class(object.label) &&
-                !config.mailbox_zone.empty() &&
-                cv::pointPolygonTest(config.mailbox_zone, zone_point, false) >= 0;
+                !zones.mailbox.empty() &&
+                cv::pointPolygonTest(zones.mailbox, zone_point, false) >= 0;
             if (in_mailbox && (!mailbox_vehicle || mailbox_vehicle->prob < object.prob)) {
                 mailbox_vehicle = &object;
                 mailbox_vehicle_center = cv::Point2f(
@@ -863,15 +1196,15 @@ void inference_loop() {
                     (object.rect.y + object.rect.height * 0.5f) / frame.rows);
             }
             const bool in_road = road_vehicle_class(object.label) &&
-                !config.road_zone.empty() &&
-                cv::pointPolygonTest(config.road_zone, zone_point, false) >= 0;
+                !zones.road.empty() &&
+                cv::pointPolygonTest(zones.road, zone_point, false) >= 0;
             if (in_road) {
                 road_detections.push_back({&object, cv::Point2f(
                     (object.rect.x + object.rect.width * 0.5f) / frame.cols,
                     (object.rect.y + object.rect.height * 0.5f) / frame.rows)});
             }
             const bool in_driveway =
-                cv::pointPolygonTest(config.driveway_zone, zone_point, false) >= 0;
+                cv::pointPolygonTest(zones.driveway, zone_point, false) >= 0;
             if (!in_driveway) {
                 if (in_mailbox || in_road) {
                     ++relevant_count;
@@ -1120,20 +1453,80 @@ void handle_client(int client_socket) {
     timeout.tv_sec = 5;
     setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-    char request_buffer[4096]{};
+    char request_buffer[8192]{};
     const ssize_t received = recv(client_socket, request_buffer,
-                                  sizeof(request_buffer) - 1, 0);
+                                  sizeof(request_buffer), 0);
     if (received <= 0) {
         close(client_socket);
         return;
     }
 
-    std::istringstream request(std::string(request_buffer, received));
+    std::string request_text(request_buffer, static_cast<std::size_t>(received));
+    const std::size_t header_end = request_text.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        send_text(client_socket, "text/plain", "Bad request\n", "400 Bad Request");
+        close(client_socket);
+        return;
+    }
+    std::size_t content_length = 0;
+    std::string lowercase_headers = request_text.substr(0, header_end);
+    std::transform(lowercase_headers.begin(), lowercase_headers.end(),
+                   lowercase_headers.begin(), [](unsigned char character) {
+                       return static_cast<char>(std::tolower(character));
+                   });
+    const std::string length_header = "\r\ncontent-length:";
+    const std::size_t length_position = lowercase_headers.find(length_header);
+    if (length_position != std::string::npos) {
+        const std::size_t number_start = length_position + length_header.size();
+        const std::size_t number_end = lowercase_headers.find("\r\n", number_start);
+        try {
+            content_length = static_cast<std::size_t>(std::stoul(
+                lowercase_headers.substr(number_start, number_end - number_start)));
+        } catch (...) {
+            content_length = 0;
+        }
+    }
+    if (content_length > 65536) {
+        send_text(client_socket, "text/plain", "Request too large\n",
+                  "413 Content Too Large");
+        close(client_socket);
+        return;
+    }
+    const std::size_t body_start = header_end + 4;
+    while (request_text.size() < body_start + content_length) {
+        const ssize_t more = recv(client_socket, request_buffer,
+                                  sizeof(request_buffer), 0);
+        if (more <= 0) {
+            break;
+        }
+        request_text.append(request_buffer, static_cast<std::size_t>(more));
+    }
+    const std::string request_body = request_text.size() >= body_start
+        ? request_text.substr(body_start, content_length) : std::string{};
+
+    std::istringstream request(request_text.substr(0, header_end));
     std::string method;
     std::string path;
     request >> method >> path;
 
-    if (method == "DELETE" && path.rfind("/api/road-events/", 0) == 0) {
+    if (method == "PUT" && path == "/api/zones") {
+        std::string error_message;
+        if (update_zones_from_form(request_body, error_message)) {
+            send_text(client_socket, "application/json", zones_json());
+        } else {
+            send_text(client_socket, "application/json",
+                      "{\"error\":\"" + json_escape(error_message) + "\"}",
+                      "400 Bad Request");
+        }
+    } else if (method == "POST" && path == "/api/zones/restore") {
+        if (restore_default_zones()) {
+            send_text(client_socket, "application/json", zones_json());
+        } else {
+            send_text(client_socket, "application/json",
+                      "{\"error\":\"The original boundaries could not be restored.\"}",
+                      "500 Internal Server Error");
+        }
+    } else if (method == "DELETE" && path.rfind("/api/road-events/", 0) == 0) {
         const std::string event_id = path.substr(std::strlen("/api/road-events/"));
         if (delete_road_event(event_id)) {
             send_text(client_socket, "application/json", "{\"deleted\":true}");
@@ -1160,6 +1553,8 @@ void handle_client(int client_socket) {
         send_text(client_socket, "application/json", events_json());
     } else if (path == "/api/road-events") {
         send_text(client_socket, "application/json", road_events_json());
+    } else if (path == "/api/zones") {
+        send_text(client_socket, "application/json", zones_json());
     } else if (path == "/stream.mjpg") {
         serve_mjpeg(client_socket);
     } else if (path.rfind("/events/", 0) == 0) {
@@ -1255,8 +1650,19 @@ int main(int argc, char** argv) {
     const char* ntfy_topic_env = std::getenv("NTFY_TOPIC");
     config.ntfy_server = ntfy_server_env ? ntfy_server_env : "";
     config.ntfy_topic = ntfy_topic_env ? ntfy_topic_env : "";
+    const char* driveway_label_env = std::getenv("DRIVEWAY_LABEL");
+    const char* mailbox_label_env = std::getenv("MAILBOX_LABEL");
+    const char* road_label_env = std::getenv("ROAD_LABEL");
+    config.driveway_label = clean_zone_label(
+        driveway_label_env ? driveway_label_env : "", "Driveway arrival");
+    config.mailbox_label = clean_zone_label(
+        mailbox_label_env ? mailbox_label_env : "", "Mailbox stop");
+    config.road_label = clean_zone_label(
+        road_label_env ? road_label_env : "", "Road archive");
+    default_zones = current_zones_locked();
     std::filesystem::create_directories(config.output_dir / "events");
     std::filesystem::create_directories(config.output_dir / "road_events");
+    load_saved_zones();
     load_existing_events();
 
     const int configured_port = static_cast<int>(

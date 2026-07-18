@@ -23,6 +23,13 @@ The colored polygons are configured as normalized `x,y` points:
 - amber: mailbox stop zone;
 - purple: passing road-traffic zone.
 
+The dashboard also includes a touch-friendly boundary editor. Select a boundary
+type, give it a useful label, and tap the corners on the live image. Changes are
+kept as a draft until **Save changes** is pressed. **Cancel** discards the draft,
+and **Restore original boundaries** always returns to the startup values from
+`.env`, so a field adjustment cannot permanently lose a known-good calibration.
+Saved edits live in `OUTPUT_DIR/zones.conf` and survive service restarts.
+
 ## Hardware used for the reference build
 
 - Raspberry Pi 5, 16 GB;
@@ -84,7 +91,7 @@ This repository is intentionally prepared for coding agents:
 
 - [AGENTS.md](AGENTS.md) records invariants, privacy rules, and verification;
 - [architecture notes](docs/ARCHITECTURE.md) explain the event pipeline;
-- [roadmap](docs/ROADMAP.md) defines the interactive boundary editor;
+- [roadmap](docs/ROADMAP.md) tracks planned editor refinements and other features;
 - [agent prompts](prompts/README.md) provide safe starting tasks for
   calibration, missed detections, and notification integrations.
 

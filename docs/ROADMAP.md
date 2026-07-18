@@ -1,16 +1,21 @@
 # Roadmap
 
-## Interactive boundary editor
+## Interactive boundary editor — first version complete
 
-The next major feature is a phone-friendly editor over the live frame:
+The dashboard now provides a phone-friendly editor over the live frame:
 
 - select driveway, mailbox, or road polygon;
-- drag existing handles and add/remove points;
+- redraw polygons by tapping corners and undo the latest point;
 - preview without changing live detection;
 - Save and Cancel controls;
 - validate normalized coordinates server-side;
 - write a dedicated zone configuration file atomically;
 - reload zones without restarting camera capture;
+- restore the immutable startup calibration from `.env`.
+
+Planned editor refinements:
+
+- drag existing handles and insert or remove individual points;
 - export/import a redacted configuration that never includes secrets.
 
 ## Later possibilities
