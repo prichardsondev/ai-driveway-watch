@@ -1,0 +1,22 @@
+[Unit]
+Description=AI Driveway Watch
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=driveway-watch
+Group=driveway-watch
+WorkingDirectory=/opt/ai-driveway-watch/cpp_pi_ncnn
+EnvironmentFile=/opt/ai-driveway-watch/cpp_pi_ncnn/.env
+ExecStart=/opt/ai-driveway-watch/cpp_pi_ncnn/build/driveway_ncnn_server
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/ai-driveway-watch/cpp_pi_ncnn/runtime
+
+[Install]
+WantedBy=multi-user.target
