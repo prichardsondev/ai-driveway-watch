@@ -5,6 +5,8 @@ Raspberry Pi 5. It decodes one RTSP/RTSPS stream with OpenCV 5, runs YOLOv8n
 through Tencent NCNN, and serves a phone-friendly dashboard without sending
 video to a cloud vision service.
 
+![Driveway Watch dashboard with configurable detection zones](docs/images/driveway-watch-dashboard.jpg)
+
 ## What it does
 
 - driveway arrivals: person and vehicle snapshots with configurable cooldowns;
