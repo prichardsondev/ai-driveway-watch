@@ -49,6 +49,7 @@ struct ServiceConfig {
     float confidence_threshold = 0.40f;
     float person_confidence_threshold = 0.25f;
     float nms_threshold = 0.50f;
+    double detection_fps = 5.0;
     std::filesystem::path output_dir = "runtime";
     std::size_t snapshot_retention = 200;
     std::string ntfy_server;
@@ -1385,7 +1386,10 @@ void inference_loop() {
             state.mailbox_stationary_seconds = mailbox_stationary_seconds;
         }
 
-        const auto next_cycle = cycle_start + std::chrono::milliseconds(200);
+        const auto detection_interval = std::chrono::duration<double>(
+            1.0 / config.detection_fps);
+        const auto next_cycle = cycle_start +
+            std::chrono::duration_cast<Clock::duration>(detection_interval);
         std::this_thread::sleep_until(next_cycle);
     }
 }
@@ -1642,6 +1646,8 @@ int main(int argc, char** argv) {
         environment_number("PERSON_CONFIDENCE_THRESHOLD", 0.25), 0.01, 0.99));
     config.nms_threshold = static_cast<float>(std::clamp(
         environment_number("NMS_THRESHOLD", 0.50), 0.01, 0.99));
+    config.detection_fps = std::clamp(
+        environment_number("DETECTION_FPS", 5.0), 1.0, 15.0);
     const char* output_env = std::getenv("OUTPUT_DIR");
     config.output_dir = output_env && *output_env ? output_env : "runtime";
     config.snapshot_retention = static_cast<std::size_t>(std::max(

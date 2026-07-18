@@ -30,6 +30,11 @@ and **Restore original boundaries** always returns to the startup values from
 `.env`, so a field adjustment cannot permanently lose a known-good calibration.
 Saved edits live in `OUTPUT_DIR/zones.conf` and survive service restarts.
 
+`DETECTION_FPS` controls how often the detector examines a frame independently
+of the camera and dashboard stream rate. Start at `5`; a cooled Raspberry Pi 5
+can often run `8` comfortably. Increase it only while inference time remains
+well below the frame interval and the Pi reports no thermal throttling.
+
 ## Hardware used for the reference build
 
 - Raspberry Pi 5, 16 GB;
