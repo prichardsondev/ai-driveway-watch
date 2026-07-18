@@ -17,6 +17,7 @@
 #include <cerrno>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <csignal>
 #include <cstdlib>
@@ -1016,6 +1017,42 @@ const char* class_name(int label) {
     }
 }
 
+void draw_zone_label(cv::Mat& frame, const std::string& label,
+                     const cv::Point& anchor, const cv::Scalar& color) {
+    if (label.empty()) {
+        return;
+    }
+
+    const double resolution_scale = static_cast<double>(frame.rows) / 720.0;
+    const double font_scale = std::clamp(0.5 * resolution_scale, 0.5, 1.15);
+    const int thickness = std::clamp(
+        static_cast<int>(std::lround(2.0 * resolution_scale)), 2, 4);
+    const int padding = std::clamp(
+        static_cast<int>(std::lround(5.0 * resolution_scale)), 5, 11);
+
+    int baseline = 0;
+    const cv::Size text_size = cv::getTextSize(
+        label, cv::FONT_HERSHEY_SIMPLEX, font_scale, thickness, &baseline);
+    const int available_x = std::max(
+        padding, frame.cols - text_size.width - padding);
+    const int text_x = std::clamp(anchor.x + padding, padding, available_x);
+    const int minimum_baseline = text_size.height + padding;
+    const int maximum_baseline = std::max(
+        minimum_baseline, frame.rows - baseline - padding);
+    const int text_baseline = std::clamp(
+        anchor.y - padding, minimum_baseline, maximum_baseline);
+
+    const cv::Rect background(
+        text_x - padding,
+        text_baseline - text_size.height - padding,
+        text_size.width + padding * 2,
+        text_size.height + baseline + padding * 2);
+    cv::rectangle(frame, background, cv::Scalar(8, 18, 14), cv::FILLED);
+    cv::putText(frame, label, cv::Point(text_x, text_baseline),
+                cv::FONT_HERSHEY_SIMPLEX, font_scale, color, thickness,
+                cv::LINE_AA);
+}
+
 void draw_zone_boundaries(cv::Mat& frame, const ZoneSettings& zones) {
     std::vector<cv::Point> driveway_pixels;
     driveway_pixels.reserve(zones.driveway.size());
@@ -1027,9 +1064,8 @@ void draw_zone_boundaries(cv::Mat& frame, const ZoneSettings& zones) {
     cv::polylines(frame, std::vector<std::vector<cv::Point>>{driveway_pixels}, true,
                   cv::Scalar(255, 190, 65), 2);
     if (!driveway_pixels.empty()) {
-        cv::putText(frame, zones.driveway_label,
-                    driveway_pixels.front() + cv::Point(4, -6),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 190, 65), 2);
+        draw_zone_label(frame, zones.driveway_label, driveway_pixels.front(),
+                        cv::Scalar(255, 190, 65));
     }
 
     if (!zones.mailbox.empty()) {
@@ -1043,9 +1079,8 @@ void draw_zone_boundaries(cv::Mat& frame, const ZoneSettings& zones) {
         cv::polylines(frame, std::vector<std::vector<cv::Point>>{mailbox_pixels}, true,
                       cv::Scalar(0, 185, 255), 2);
         if (!mailbox_pixels.empty()) {
-            cv::putText(frame, zones.mailbox_label,
-                        mailbox_pixels.front() + cv::Point(4, -6),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 185, 255), 2);
+            draw_zone_label(frame, zones.mailbox_label, mailbox_pixels.front(),
+                            cv::Scalar(0, 185, 255));
         }
     }
 
@@ -1060,10 +1095,8 @@ void draw_zone_boundaries(cv::Mat& frame, const ZoneSettings& zones) {
         cv::polylines(frame, std::vector<std::vector<cv::Point>>{road_pixels}, true,
                       cv::Scalar(210, 80, 210), 2);
         if (!road_pixels.empty()) {
-            cv::putText(frame, zones.road_label,
-                        road_pixels.front() + cv::Point(4, -6),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.5,
-                        cv::Scalar(210, 80, 210), 2);
+            draw_zone_label(frame, zones.road_label, road_pixels.front(),
+                            cv::Scalar(210, 80, 210));
         }
     }
 }
