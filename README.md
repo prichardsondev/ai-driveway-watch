@@ -126,10 +126,11 @@ tests/         Python prototype tests
 - A random public ntfy topic is a bearer secret, not full authentication.
 - The service classifies common COCO objects; it does not identify people,
   license plates, or whether a vehicle truly belongs to a mail carrier.
-- Animal alerts enable the standard COCO animal classes except giraffe, which
-  is ignored because it produced a repeatable flag false positive in the
-  reference view. The model has no dedicated deer class, so wildlife may be
-  reported as the closest enabled animal or occasionally missed.
+- Animal alerts enable the standard COCO animal classes except zebra and
+  giraffe, which are ignored because they produced repeatable flag false
+  positives in the reference view. The model has no dedicated deer class, so
+  wildlife may be reported as the closest enabled animal or occasionally
+  missed.
 - Mailbox alerts intentionally say “vehicle stopped near mailbox.”
 - Comply with local camera, audio, notice, and data-retention laws.
 

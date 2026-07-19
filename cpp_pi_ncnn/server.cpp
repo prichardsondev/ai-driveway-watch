@@ -994,7 +994,7 @@ refreshStreamPreference();update();updateEvents();setInterval(update,1000);setIn
 </body></html>)HTML";
 
 bool animal_class(int label) {
-    return label >= 14 && label <= 22;
+    return label >= 14 && label <= 21;
 }
 
 bool relevant_class(int label) {
@@ -1014,6 +1014,19 @@ struct RoadDetection {
     const Object* object = nullptr;
     cv::Point2f center;
 };
+
+struct DetectionOverlay {
+    cv::Rect box;
+    std::string label;
+    cv::Scalar color;
+};
+
+void draw_detection_overlay(cv::Mat& frame, const DetectionOverlay& overlay) {
+    cv::rectangle(frame, overlay.box, overlay.color, 3);
+    cv::putText(frame, overlay.label,
+                cv::Point(overlay.box.x, std::max(24, overlay.box.y) - 7),
+                cv::FONT_HERSHEY_SIMPLEX, 0.65, overlay.color, 2);
+}
 
 struct RoadTrack {
     unsigned long id = 0;
@@ -1239,6 +1252,7 @@ void inference_loop() {
         const Object* mailbox_vehicle = nullptr;
         cv::Point2f mailbox_vehicle_center;
         std::vector<RoadDetection> road_detections;
+        std::vector<DetectionOverlay> detection_overlays;
         std::map<std::string, const Object*> present_classes;
         for (const auto& object : objects) {
             if (!relevant_class(object.label)) {
@@ -1280,14 +1294,10 @@ void inference_loop() {
                     ? cv::Scalar(65, 229, 141)
                     : (inside_mailbox ? cv::Scalar(0, 185, 255)
                                       : cv::Scalar(210, 80, 210));
-                const cv::Rect box = object.rect;
-                cv::rectangle(frame, box, color, 3);
                 std::ostringstream label;
                 label << "animal " << class_name(object.label) << " " << std::fixed
                       << std::setprecision(0) << object.prob * 100.0f << "%";
-                cv::putText(frame, label.str(),
-                            cv::Point(box.x, std::max(24, box.y) - 7),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.65, color, 2);
+                detection_overlays.push_back({object.rect, label.str(), color});
                 continue;
             }
 
@@ -1307,17 +1317,13 @@ void inference_loop() {
             if (!inside_driveway) {
                 if (in_mailbox || in_road) {
                     ++relevant_count;
-                    const cv::Rect box = object.rect;
                     const cv::Scalar color = in_mailbox
                         ? cv::Scalar(0, 185, 255) : cv::Scalar(210, 80, 210);
-                    cv::rectangle(frame, box, color, 3);
                     std::ostringstream label;
                     label << (in_mailbox ? "mailbox " : "road ")
                           << class_name(object.label) << " " << std::fixed
                           << std::setprecision(0) << object.prob * 100.0f << "%";
-                    cv::putText(frame, label.str(),
-                                cv::Point(box.x, std::max(24, box.y) - 7),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.65, color, 2);
+                    detection_overlays.push_back({object.rect, label.str(), color});
                 }
                 continue;
             }
@@ -1331,14 +1337,11 @@ void inference_loop() {
                 existing->second->prob < object.prob) {
                 present_classes[name] = &object;
             }
-            const cv::Rect box = object.rect;
-            cv::rectangle(frame, box, cv::Scalar(65, 229, 141), 3);
             std::ostringstream label;
             label << name << " " << std::fixed
                   << std::setprecision(0) << object.prob * 100.0f << "%";
-            const int top = std::max(24, box.y);
-            cv::putText(frame, label.str(), cv::Point(box.x, top - 7),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(65, 229, 141), 2);
+            detection_overlays.push_back(
+                {object.rect, label.str(), cv::Scalar(65, 229, 141)});
         }
 
         const auto event_now = Clock::now();
@@ -1371,9 +1374,19 @@ void inference_loop() {
             }
 
             road_tracks.push_back({++road_track_sequence, detection.center, event_now, true});
+            const cv::Scalar road_color(210, 80, 210);
+            std::ostringstream road_label;
+            road_label << "road " << class_name(detection.object->label) << " "
+                       << std::fixed << std::setprecision(0)
+                       << detection.object->prob * 100.0f << "%";
+            cv::Mat road_snapshot;
+            frame.copyTo(road_snapshot);
+            draw_detection_overlay(
+                road_snapshot,
+                {detection.object->rect, road_label.str(), road_color});
             EventInfo road_event = create_road_event(
-                frame, class_name(detection.object->label), detection.object->prob,
-                ++road_event_sequence);
+                road_snapshot, class_name(detection.object->label),
+                detection.object->prob, ++road_event_sequence);
             {
                 std::lock_guard<std::mutex> lock(state.status_mutex);
                 state.recent_road_events.push_front(std::move(road_event));
@@ -1382,6 +1395,9 @@ void inference_loop() {
                 }
                 ++state.road_event_count;
             }
+        }
+        for (const auto& overlay : detection_overlays) {
+            draw_detection_overlay(frame, overlay);
         }
         double mailbox_stationary_seconds = 0.0;
         if (mailbox_vehicle) {
