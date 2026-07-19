@@ -949,7 +949,7 @@ function refreshStreamPreference(){toggleBoundaries.textContent=boundariesVisibl
 function cloneZones(zones){return JSON.parse(JSON.stringify(zones));}
 function selectedZone(){return workingZones.find(zone=>zone.id===zoneType.value);}
 function resizeBoundaryCanvas(){const rectangle=liveStream.getBoundingClientRect();boundaryCanvas.width=Math.max(1,Math.round(rectangle.width));boundaryCanvas.height=Math.max(1,Math.round(rectangle.height));drawBoundaries();}
-function drawBoundaries(){boundaryContext.clearRect(0,0,boundaryCanvas.width,boundaryCanvas.height);for(const zone of workingZones){if(!zone.points.length)continue;const selected=zone.id===zoneType.value;boundaryContext.beginPath();zone.points.forEach((point,index)=>{const x=point[0]*boundaryCanvas.width;const y=point[1]*boundaryCanvas.height;if(index===0)boundaryContext.moveTo(x,y);else boundaryContext.lineTo(x,y);});if(zone.points.length>=3)boundaryContext.closePath();boundaryContext.globalAlpha=selected ? .20 : .08;boundaryContext.fillStyle=zone.color;boundaryContext.fill();boundaryContext.globalAlpha=1;boundaryContext.strokeStyle=zone.color;boundaryContext.lineWidth=selected?4:2;boundaryContext.stroke();if(selected){for(const point of zone.points){boundaryContext.beginPath();boundaryContext.arc(point[0]*boundaryCanvas.width,point[1]*boundaryCanvas.height,7,0,Math.PI*2);boundaryContext.fillStyle=zone.color;boundaryContext.fill();boundaryContext.strokeStyle='#07100d';boundaryContext.lineWidth=2;boundaryContext.stroke();}}}}
+function drawBoundaries(){boundaryContext.clearRect(0,0,boundaryCanvas.width,boundaryCanvas.height);for(const zone of workingZones){if(!zone.points.length)continue;const selected=zone.id===zoneType.value;boundaryContext.beginPath();zone.points.forEach((point,index)=>{const x=point[0]*boundaryCanvas.width;const y=point[1]*boundaryCanvas.height;if(index===0)boundaryContext.moveTo(x,y);else boundaryContext.lineTo(x,y);});if(zone.points.length>=3)boundaryContext.closePath();boundaryContext.globalAlpha=selected ? .20 : .08;boundaryContext.fillStyle=zone.color;boundaryContext.fill();boundaryContext.globalAlpha=1;boundaryContext.strokeStyle=zone.color;boundaryContext.lineWidth=selected?6:4;boundaryContext.stroke();if(selected){for(const point of zone.points){boundaryContext.beginPath();boundaryContext.arc(point[0]*boundaryCanvas.width,point[1]*boundaryCanvas.height,8,0,Math.PI*2);boundaryContext.fillStyle=zone.color;boundaryContext.fill();boundaryContext.strokeStyle='#07100d';boundaryContext.lineWidth=3;boundaryContext.stroke();}}}}
 function refreshZoneEditor(){const zone=selectedZone();if(!zone)return;zoneLabel.value=zone.label;redrawing=false;pointStatus.textContent=zone.points.length+' points loaded. Press “Redraw this boundary” to replace it.';boundaryStatus.className='save-status note';boundaryStatus.textContent='';drawBoundaries();}
 async function openBoundaryEditor(){boundaryStatus.textContent='Loading boundaries…';try{const response=await fetch('/api/zones',{cache:'no-store'});if(!response.ok)throw new Error('load failed');const data=await response.json();baselineZones=cloneZones(data.zones);workingZones=cloneZones(data.zones);boundaryEditor.hidden=false;boundaryCanvas.hidden=false;zoneType.value='driveway';resizeBoundaryCanvas();refreshZoneEditor();boundaryEditor.scrollIntoView({behavior:'smooth',block:'nearest'});}catch(error){boundaryEditor.hidden=false;boundaryStatus.className='save-status error';boundaryStatus.textContent='The boundaries could not be loaded. No settings were changed.';}}
 function closeBoundaryEditor(){workingZones=cloneZones(baselineZones);boundaryEditor.hidden=true;boundaryCanvas.hidden=true;redrawing=false;boundaryStatus.textContent='';}
@@ -1094,6 +1094,9 @@ void draw_zone_label(cv::Mat& frame, const std::string& label,
 }
 
 void draw_zone_boundaries(cv::Mat& frame, const ZoneSettings& zones) {
+    const double resolution_scale = static_cast<double>(frame.rows) / 720.0;
+    const int boundary_thickness = std::clamp(
+        static_cast<int>(std::lround(4.0 * resolution_scale)), 4, 9);
     std::vector<cv::Point> driveway_pixels;
     driveway_pixels.reserve(zones.driveway.size());
     for (const auto& point : zones.driveway) {
@@ -1102,7 +1105,7 @@ void draw_zone_boundaries(cv::Mat& frame, const ZoneSettings& zones) {
             static_cast<int>(point.y * frame.rows));
     }
     cv::polylines(frame, std::vector<std::vector<cv::Point>>{driveway_pixels}, true,
-                  cv::Scalar(255, 190, 65), 2);
+                  cv::Scalar(255, 190, 65), boundary_thickness, cv::LINE_AA);
     if (!driveway_pixels.empty()) {
         draw_zone_label(frame, zones.driveway_label, driveway_pixels.front(),
                         cv::Scalar(255, 190, 65));
@@ -1117,7 +1120,7 @@ void draw_zone_boundaries(cv::Mat& frame, const ZoneSettings& zones) {
                 static_cast<int>(point.y * frame.rows));
         }
         cv::polylines(frame, std::vector<std::vector<cv::Point>>{mailbox_pixels}, true,
-                      cv::Scalar(0, 185, 255), 2);
+                      cv::Scalar(0, 185, 255), boundary_thickness, cv::LINE_AA);
         if (!mailbox_pixels.empty()) {
             draw_zone_label(frame, zones.mailbox_label, mailbox_pixels.front(),
                             cv::Scalar(0, 185, 255));
@@ -1133,7 +1136,7 @@ void draw_zone_boundaries(cv::Mat& frame, const ZoneSettings& zones) {
                 static_cast<int>(point.y * frame.rows));
         }
         cv::polylines(frame, std::vector<std::vector<cv::Point>>{road_pixels}, true,
-                      cv::Scalar(210, 80, 210), 2);
+                      cv::Scalar(210, 80, 210), boundary_thickness, cv::LINE_AA);
         if (!road_pixels.empty()) {
             draw_zone_label(frame, zones.road_label, road_pixels.front(),
                             cv::Scalar(210, 80, 210));
