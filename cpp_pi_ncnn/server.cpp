@@ -55,6 +55,7 @@ struct ServiceConfig {
     float person_confidence_threshold = 0.25f;
     float animal_confidence_threshold = 0.35f;
     bool animal_alerts_enabled = true;
+    bool general_events_enabled = true;
     float wildlife_confidence_threshold = 0.20f;
     float nms_threshold = 0.50f;
     double detection_fps = 5.0;
@@ -70,6 +71,9 @@ struct ServiceConfig {
     float species_confidence_threshold = 0.65f;
     double species_classifier_timeout_seconds = 8.0;
     double species_cache_seconds = 8.0;
+    bool wildlife_test_captures_enabled = false;
+    double wildlife_test_cooldown_seconds = 30.0;
+    std::size_t wildlife_test_snapshot_retention = 200;
     std::filesystem::path manual_storage_root =
         "/mnt/driveway-recordings";
     double manual_recording_seconds = 30.0;
@@ -147,9 +151,11 @@ struct SharedState {
     double mailbox_stationary_seconds = 0.0;
     unsigned long event_count = 0;
     unsigned long road_event_count = 0;
+    unsigned long wildlife_test_event_count = 0;
     unsigned long notification_count = 0;
     std::deque<EventInfo> recent_events;
     std::deque<EventInfo> recent_road_events;
+    std::deque<EventInfo> recent_wildlife_test_events;
     std::string last_error;
     std::string notification_error;
 };
@@ -1205,10 +1211,20 @@ EventInfo create_road_event(const cv::Mat& frame, const std::string& class_name,
                                  config.road_snapshot_retention);
 }
 
+EventInfo create_wildlife_test_event(
+        const cv::Mat& frame, const std::string& class_name,
+        float confidence, unsigned long sequence) {
+    return create_archived_event(
+        frame, class_name, confidence, sequence,
+        "wildlife_test", "wildlife_test.csv",
+        config.wildlife_test_snapshot_retention);
+}
+
 bool delete_archived_event(const std::string& event_id,
                            const std::string& archive_directory,
                            const std::string& log_filename,
-                           bool road_archive) {
+                           bool road_archive,
+                           bool wildlife_test_archive = false) {
     if (event_id.empty() || !std::all_of(event_id.begin(), event_id.end(),
             [](unsigned char ch) { return std::isalnum(ch) || ch == '-' || ch == '_'; })) {
         return false;
@@ -1267,7 +1283,9 @@ bool delete_archived_event(const std::string& event_id,
     }
     {
         std::lock_guard<std::mutex> state_lock(state.status_mutex);
-        auto& recent = road_archive ? state.recent_road_events : state.recent_events;
+        auto& recent = wildlife_test_archive
+            ? state.recent_wildlife_test_events
+            : (road_archive ? state.recent_road_events : state.recent_events);
         for (auto iterator = recent.begin(); iterator != recent.end();) {
             if (iterator->id == event_id) {
                 iterator = recent.erase(iterator);
@@ -1275,7 +1293,9 @@ bool delete_archived_event(const std::string& event_id,
                 ++iterator;
             }
         }
-        auto& count = road_archive ? state.road_event_count : state.event_count;
+        auto& count = wildlife_test_archive
+            ? state.wildlife_test_event_count
+            : (road_archive ? state.road_event_count : state.event_count);
         if (count > 0) {
             --count;
         }
@@ -1289,6 +1309,11 @@ bool delete_event(const std::string& event_id) {
 
 bool delete_road_event(const std::string& event_id) {
     return delete_archived_event(event_id, "road_events", "road_events.csv", true);
+}
+
+bool delete_wildlife_test_event(const std::string& event_id) {
+    return delete_archived_event(
+        event_id, "wildlife_test", "wildlife_test.csv", false, true);
 }
 
 std::pair<std::deque<EventInfo>, unsigned long> read_event_log(
@@ -1329,11 +1354,14 @@ std::pair<std::deque<EventInfo>, unsigned long> read_event_log(
 void load_existing_events() {
     auto driveway = read_event_log("events.csv");
     auto road = read_event_log("road_events.csv");
+    auto wildlife_test = read_event_log("wildlife_test.csv");
     std::lock_guard<std::mutex> lock(state.status_mutex);
     state.recent_events = std::move(driveway.first);
     state.event_count = driveway.second;
     state.recent_road_events = std::move(road.first);
     state.road_event_count = road.second;
+    state.recent_wildlife_test_events = std::move(wildlife_test.first);
+    state.wildlife_test_event_count = wildlife_test.second;
 }
 
 std::string status_json() {
@@ -1402,6 +1430,12 @@ std::string status_json() {
          << ",\"mailbox_stationary_seconds\":" << state.mailbox_stationary_seconds
          << ",\"event_count\":" << state.event_count
          << ",\"road_event_count\":" << state.road_event_count
+         << ",\"general_events_enabled\":"
+         << (config.general_events_enabled ? "true" : "false")
+         << ",\"wildlife_test_captures_enabled\":"
+         << (config.wildlife_test_captures_enabled ? "true" : "false")
+         << ",\"wildlife_test_event_count\":"
+         << state.wildlife_test_event_count
          << ",\"manual_storage_ready\":"
          << (storage_ready ? "true" : "false")
          << ",\"manual_storage_free_gb\":" << storage_free_gb
@@ -1454,6 +1488,13 @@ std::string road_events_json() {
                                 "/api/road-events/");
 }
 
+std::string wildlife_test_events_json() {
+    std::lock_guard<std::mutex> lock(state.status_mutex);
+    return archived_events_json(
+        state.recent_wildlife_test_events, "/wildlife-test/",
+        "/api/wildlife-test-events/");
+}
+
 const char* dashboard_html = R"HTML(<!doctype html>
 <html lang="en">
 <head>
@@ -1466,10 +1507,10 @@ const char* dashboard_html = R"HTML(<!doctype html>
 header,main{width:min(1120px,94vw);margin:auto}header{display:flex;align-items:center;justify-content:space-between;padding:24px 0 16px}
 h1,h2,p{margin:0}.live{display:flex;align-items:center;gap:8px;color:#a9f5cf}.dot{width:10px;height:10px;border-radius:50%;background:#40e58d;box-shadow:0 0 14px #40e58d}
 .video{position:relative;overflow:hidden;border:1px solid #315c4b;border-radius:18px;background:#020504;box-shadow:0 20px 70px #0008}.video img{display:block;width:100%;aspect-ratio:16/9;object-fit:contain}.boundary-canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair;touch-action:none}
-.capture-controls{display:flex;align-items:end;flex-wrap:wrap;gap:10px}.capture-controls .field{min-width:120px}.capture-status{min-height:1.5em;margin-top:12px;color:#a9f5cf}.manual-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:18px;padding-top:16px;border-top:1px solid #29483d}.manual-heading h3{margin:0;font-size:1rem}.manual-list{display:grid;gap:8px;margin-top:10px}.manual-capture{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-radius:10px;background:#183126}.manual-link{min-width:0;color:#a9f5cf;text-decoration:none}.manual-link strong,.manual-link small{display:block}.manual-link strong{overflow:hidden;text-overflow:ellipsis}.manual-link small{margin-top:3px;color:#91b7a5}.button:disabled{cursor:not-allowed;opacity:.55}
+.capture-controls{display:flex;align-items:end;flex-wrap:wrap;gap:10px}.capture-controls .field{min-width:120px}.capture-status{min-height:1.5em;margin-top:12px;color:#a9f5cf}.manual-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:18px;padding-top:16px;border-top:1px solid #29483d}.manual-heading h3{margin:0;font-size:1rem}.manual-list{display:grid;gap:8px;margin-top:10px}.manual-capture{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-radius:10px;background:#183126}.manual-link{min-width:0;color:#a9f5cf;text-decoration:none}.manual-link strong,.manual-link small{display:block}.manual-link strong{overflow:hidden;text-overflow:ellipsis}.manual-link small{margin-top:3px;color:#91b7a5}.capture-preview{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;background:#07100d}.capture-actions{display:flex;gap:7px}.download{display:grid;place-items:center;flex:0 0 42px;width:42px;height:42px;border:1px solid #4d9a75;border-radius:10px;background:#24513d;color:#fff;text-decoration:none;font-size:1.1rem;cursor:pointer}.download:hover{background:#326b51}.button:disabled{cursor:not-allowed;opacity:.55}
 .panel{margin:18px 0;padding:20px;border:1px solid #29483d;border-radius:16px;background:#102219dd}.panel h2{font-size:1.1rem;margin-bottom:16px}
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.stat{padding:14px;border-radius:12px;background:#183126}.label{font-size:.78rem;color:#91b7a5;text-transform:uppercase;letter-spacing:.06em}.value{font-size:1.25rem;margin-top:5px}
-.tabs{display:flex;gap:8px;margin:18px 0}.tab{flex:1;padding:13px;border:1px solid #315c4b;border-radius:12px;background:#102219;color:#a9c7ba;font-weight:700;cursor:pointer}.tab.active{background:#24513d;color:#fff;border-color:#4d9a75}[hidden]{display:none!important}.events{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}.event{overflow:hidden;border-radius:12px;background:#183126}.event-image{display:block;width:100%;padding:0;border:0;background:#07100d;cursor:zoom-in}.event-image img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover}.meta{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px}.meta-text{min-width:0}.event strong{display:block;text-transform:capitalize}.event small{color:#91b7a5}.delete{display:grid;place-items:center;flex:0 0 42px;width:42px;height:42px;border:1px solid #70433f;border-radius:10px;background:#3b2422;color:#ffd4cf;font-size:1.15rem;cursor:pointer}.delete:hover{background:#60302c}.note{color:#a9c7ba;line-height:1.5}.boundary-summary{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:12px}.boundary-buttons{display:flex;gap:8px}.button{min-height:44px;padding:10px 15px;border:1px solid #4d9a75;border-radius:10px;background:#24513d;color:#fff;font-weight:700;cursor:pointer}.button.secondary{border-color:#527065;background:#183126}.button.danger{border-color:#70433f;background:#3b2422;color:#ffd4cf}.editor-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{display:grid;gap:7px;color:#a9c7ba;font-size:.85rem}.field select,.field input{width:100%;min-height:44px;padding:9px 11px;border:1px solid #527065;border-radius:10px;background:#07100d;color:#fff;font:inherit}.editor-tools,.editor-save{display:flex;flex-wrap:wrap;gap:9px;margin-top:14px}.editor-save{justify-content:flex-end;padding-top:14px;border-top:1px solid #29483d}.point-status{margin-top:12px;color:#a9f5cf}.save-status{min-height:1.5em;margin-top:10px}.save-status.error{color:#ffb3aa}.save-status.success{color:#a9f5cf}dialog.viewer{width:100vw;height:100vh;max-width:none;max-height:none;margin:0;padding:70px 18px 18px;border:0;background:#020504f2;color:#edf8f3}.viewer::backdrop{background:#000d}.viewer img{display:block;width:100%;height:calc(100vh - 110px);object-fit:contain}.viewer-bar{position:fixed;z-index:2;top:0;left:0;right:0;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px;background:#07100df2}.viewer-actions{display:flex;gap:8px}.viewer-close{display:grid;place-items:center;width:44px;height:44px;border:1px solid #527065;border-radius:10px;background:#183126;color:#fff;font-size:1.6rem;cursor:pointer}@media(max-width:720px){.stats{grid-template-columns:repeat(2,1fr)}.editor-grid{grid-template-columns:1fr}.boundary-summary{align-items:flex-start;flex-direction:column}.boundary-buttons{width:100%}.boundary-buttons .button{flex:1}.capture-controls{align-items:stretch}.capture-controls .field,.capture-controls .button{flex:1 1 140px}.editor-save .button{flex:1}}
+.tabs{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}.tab{flex:1 1 180px;padding:13px;border:1px solid #315c4b;border-radius:12px;background:#102219;color:#a9c7ba;font-weight:700;cursor:pointer}.tab.active{background:#24513d;color:#fff;border-color:#4d9a75}[hidden]{display:none!important}.events{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}.event{overflow:hidden;border-radius:12px;background:#183126}.event-image{display:block;width:100%;padding:0;border:0;background:#07100d;cursor:zoom-in}.event-image img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover}.meta{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px}.meta-text{min-width:0}.event strong{display:block;text-transform:capitalize}.event small{color:#91b7a5}.delete{display:grid;place-items:center;flex:0 0 42px;width:42px;height:42px;border:1px solid #70433f;border-radius:10px;background:#3b2422;color:#ffd4cf;font-size:1.15rem;cursor:pointer}.delete:hover{background:#60302c}.note{color:#a9c7ba;line-height:1.5}.boundary-summary{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:12px}.boundary-buttons{display:flex;gap:8px}.button{min-height:44px;padding:10px 15px;border:1px solid #4d9a75;border-radius:10px;background:#24513d;color:#fff;font-weight:700;cursor:pointer}.button.secondary{border-color:#527065;background:#183126}.button.danger{border-color:#70433f;background:#3b2422;color:#ffd4cf}.editor-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{display:grid;gap:7px;color:#a9c7ba;font-size:.85rem}.field select,.field input{width:100%;min-height:44px;padding:9px 11px;border:1px solid #527065;border-radius:10px;background:#07100d;color:#fff;font:inherit}.editor-tools,.editor-save{display:flex;flex-wrap:wrap;gap:9px;margin-top:14px}.editor-save{justify-content:flex-end;padding-top:14px;border-top:1px solid #29483d}.point-status{margin-top:12px;color:#a9f5cf}.save-status{min-height:1.5em;margin-top:10px}.save-status.error{color:#ffb3aa}.save-status.success{color:#a9f5cf}dialog.viewer{width:100vw;height:100vh;max-width:none;max-height:none;margin:0;padding:70px 18px 18px;border:0;background:#020504f2;color:#edf8f3}.viewer::backdrop{background:#000d}.viewer img{display:block;width:100%;height:calc(100vh - 110px);object-fit:contain}.viewer-bar{position:fixed;z-index:2;top:0;left:0;right:0;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px;background:#07100df2}.viewer-actions{display:flex;gap:8px}.viewer-close{display:grid;place-items:center;width:44px;height:44px;border:1px solid #527065;border-radius:10px;background:#183126;color:#fff;font-size:1.6rem;cursor:pointer}@media(max-width:720px){.stats{grid-template-columns:repeat(2,1fr)}.editor-grid{grid-template-columns:1fr}.boundary-summary{align-items:flex-start;flex-direction:column}.boundary-buttons{width:100%}.boundary-buttons .button{flex:1}.capture-controls{align-items:stretch}.capture-controls .field,.capture-controls .button{flex:1 1 140px}.editor-save .button{flex:1}}
 </style>
 </head>
 <body>
@@ -1506,10 +1547,11 @@ h1,h2,p{margin:0}.live{display:flex;align-items:center;gap:8px;color:#a9f5cf}.do
 <div class="stat"><div class="label">Objects now</div><div class="value" id="objects">—</div></div>
 <div class="stat"><div class="label">Frames</div><div class="value" id="frames">—</div></div>
 </div></section>
-<div class="tabs" role="tablist" aria-label="Event archive"><button class="tab active" id="driveway-tab" type="button" role="tab" aria-selected="true">Alerts (<span id="driveway-count">0</span>)</button><button class="tab" id="road-tab" type="button" role="tab" aria-selected="false">Road traffic (<span id="road-count">0</span>)</button><button class="tab" id="captures-tab" type="button" role="tab" aria-selected="false">Captures (<span id="captures-count">0</span>)</button></div>
+<div class="tabs" role="tablist" aria-label="Event archive"><button class="tab active" id="driveway-tab" type="button" role="tab" aria-selected="true">Alerts (<span id="driveway-count">0</span>)</button><button class="tab" id="road-tab" type="button" role="tab" aria-selected="false">Road traffic (<span id="road-count">0</span>)</button><button class="tab" id="wildlife-test-tab" type="button" role="tab" aria-selected="false" hidden>Wildlife test (<span id="wildlife-test-count">0</span>)</button><button class="tab" id="captures-tab" type="button" role="tab" aria-selected="false">Captures (<span id="captures-count">0</span>)</button></div>
 <div id="driveway-panel" role="tabpanel"><section class="panel"><h2>Recent alerts</h2><div class="events" id="events"><p class="note">No alerts yet</p></div></section><section class="panel"><h2>Notifications</h2><p class="note" id="notifications">Checking phone alerts…</p></section></div>
 <div id="road-panel" role="tabpanel" hidden><section class="panel"><h2>Road traffic archive</h2><p class="note" style="margin-bottom:16px">Passing vehicle snapshots do not send alerts. Animals inside any boundary do.</p><div class="events" id="road-events"><p class="note">No passing vehicles captured yet</p></div></section></div>
-<div id="captures-panel" role="tabpanel" hidden><section class="panel"><h2>Saved captures</h2><div class="manual-list" id="manual-captures"><p class="note">No manual captures yet</p></div></section></div>
+<div id="wildlife-test-panel" role="tabpanel" hidden><section class="panel"><h2>Wildlife test candidates</h2><p class="note" style="margin-bottom:16px">Locally saved classifier tests only. Rejected candidates are labeled and never send notifications.</p><div class="events" id="wildlife-test-events"><p class="note">No wildlife candidates captured yet</p></div></section></div>
+<div id="captures-panel" role="tabpanel" hidden><section class="panel"><h2>Saved captures</h2><div class="events" id="manual-captures"><p class="note">No manual captures yet</p></div></section></div>
 </main>
 <dialog class="viewer" id="viewer" aria-labelledby="viewer-caption">
 <div class="viewer-bar"><strong id="viewer-caption">Driveway event</strong><div class="viewer-actions"><button class="delete" id="viewer-delete" type="button" aria-label="Delete this event" title="Delete this event">🗑️</button><button class="viewer-close" id="viewer-close" type="button" aria-label="Close full-screen image">×</button></div></div>
@@ -1540,7 +1582,7 @@ async function saveSnapshotBurst(){const button=document.getElementById('snapsho
 async function toggleManualRecording(){const button=document.getElementById('record-button');const status=document.getElementById('capture-status');button.disabled=true;try{const action=recordingActive?'stop':'start';const response=await fetch('/api/manual/recordings/'+action,{method:'POST'});const data=await response.json();if(!response.ok)throw new Error(data.error||'Recording command failed.');status.textContent=recordingActive?'Stopping and finishing the video…':'Recording camera-native video to SSD. You may close this page.';await update();}catch(error){status.textContent=error.message;}finally{button.disabled=false;}}
 function formatBytes(bytes){if(bytes<1024)return bytes+' B';if(bytes<1024*1024)return (bytes/1024).toFixed(1)+' KB';if(bytes<1024*1024*1024)return (bytes/(1024*1024)).toFixed(1)+' MB';return (bytes/(1024*1024*1024)).toFixed(1)+' GB';}
 async function deleteManualCapture(item){if(!confirm('Delete this '+(item.kind==='videos'?'video':'snapshot')+' from the recording SSD?'))return;const response=await fetch(item.delete_path,{method:'DELETE'});if(response.ok)await updateManualCaptures();}
-async function updateManualCaptures(){const box=document.getElementById('manual-captures');try{const response=await fetch('/api/manual-captures',{cache:'no-store'});const captures=await response.json();document.getElementById('captures-count').textContent=captures.length.toLocaleString();box.replaceChildren();if(!captures.length){const empty=document.createElement('p');empty.className='note';empty.textContent='No manual captures yet';box.appendChild(empty);return;}for(const item of captures){const row=document.createElement('div');row.className='manual-capture';const link=document.createElement('a');link.className='manual-link';link.href=item.url;link.download=item.name;const title=document.createElement('strong');title.textContent=item.kind==='videos'?'Video recording':'Snapshot';const details=document.createElement('small');details.textContent=new Date(item.timestamp_ms).toLocaleString()+' · '+formatBytes(item.size_bytes)+' · tap to download';link.append(title,details);const remove=document.createElement('button');remove.className='delete';remove.type='button';remove.title='Delete capture';remove.setAttribute('aria-label','Delete manual capture');remove.textContent='🗑️';remove.addEventListener('click',()=>deleteManualCapture(item));row.append(link,remove);box.appendChild(row);}}catch(error){document.getElementById('captures-count').textContent='—';box.innerHTML='<p class="note">Saved captures are temporarily unavailable.</p>';}}
+async function updateManualCaptures(){const box=document.getElementById('manual-captures');try{const response=await fetch('/api/manual-captures',{cache:'no-store'});const captures=await response.json();document.getElementById('captures-count').textContent=captures.length.toLocaleString();box.replaceChildren();if(!captures.length){const empty=document.createElement('p');empty.className='note';empty.textContent='No manual captures yet';box.appendChild(empty);return;}for(const item of captures){const card=document.createElement('article');card.className='event';const preview=item.kind==='videos'?document.createElement('video'):document.createElement('img');preview.className='capture-preview';preview.src=item.url+'?preview=1';if(item.kind==='videos'){preview.controls=true;preview.preload='metadata';}else preview.alt='Saved driveway snapshot';const meta=document.createElement('div');meta.className='meta';const text=document.createElement('div');text.className='meta-text';const title=document.createElement('strong');title.textContent=item.kind==='videos'?'Video recording':'Snapshot';const details=document.createElement('small');details.textContent=new Date(item.timestamp_ms).toLocaleString()+' · '+formatBytes(item.size_bytes);text.append(title,details);const actions=document.createElement('div');actions.className='capture-actions';const download=document.createElement('a');download.className='download';download.href=item.url;download.download=item.name;download.title='Download capture';download.setAttribute('aria-label','Download capture');download.textContent='⬇️';const remove=document.createElement('button');remove.className='delete';remove.type='button';remove.title='Delete capture';remove.setAttribute('aria-label','Delete manual capture');remove.textContent='🗑️';remove.addEventListener('click',()=>deleteManualCapture(item));actions.append(download,remove);meta.append(text,actions);card.append(preview,meta);box.appendChild(card);}}catch(error){document.getElementById('captures-count').textContent='—';box.innerHTML='<p class="note">Saved captures are temporarily unavailable.</p>';}}
 document.getElementById('snapshot-button').addEventListener('click',saveSnapshotBurst);
 document.getElementById('record-button').addEventListener('click',toggleManualRecording);
 function cloneZones(zones){return JSON.parse(JSON.stringify(zones));}
@@ -1591,14 +1633,16 @@ else if(s.manual_recording_error)captureStatus.textContent=s.manual_recording_er
 else if(recordingWasActive){captureStatus.textContent='Recording saved to the SSD.';updateManualCaptures();}
 document.getElementById('driveway-count').textContent=s.event_count.toLocaleString();
 document.getElementById('road-count').textContent=s.road_event_count.toLocaleString();
+document.getElementById('wildlife-test-count').textContent=s.wildlife_test_event_count.toLocaleString();
+document.getElementById('wildlife-test-tab').hidden=!s.wildlife_test_captures_enabled;
 const n=document.getElementById('notifications');
 if(!s.notification_enabled)n.textContent='Phone alerts are not configured.';
 else if(s.notification_error)n.textContent='Phone alerts need attention: '+s.notification_error;
 else n.textContent='ntfy phone alerts are active. '+s.notification_count+' event alert'+(s.notification_count===1?' has':'s have')+' been sent since this service started.';}catch(e){document.getElementById('health').textContent='Reconnecting';}}
-function renderEvents(list,box,emptyText){box.replaceChildren();if(!list.length){const p=document.createElement('p');p.className='note';p.textContent=emptyText;box.appendChild(p);return;}for(const event of list){const card=document.createElement('article');card.className='event';const imageButton=document.createElement('button');imageButton.className='event-image';imageButton.type='button';imageButton.setAttribute('aria-label','Open '+eventName(event)+' event full screen');const img=document.createElement('img');img.src=event.snapshot;img.alt=eventName(event)+' event';imageButton.appendChild(img);imageButton.addEventListener('click',()=>openEvent(event));const meta=document.createElement('div');meta.className='meta';const text=document.createElement('div');text.className='meta-text';const name=document.createElement('strong');name.textContent=eventName(event)+' — '+Math.round(event.confidence*100)+'%';const time=document.createElement('small');time.textContent=new Date(event.timestamp).toLocaleString();text.append(name,time);const remove=document.createElement('button');remove.className='delete';remove.type='button';remove.title='Delete this event';remove.setAttribute('aria-label','Delete '+eventName(event)+' event');remove.textContent='🗑️';remove.addEventListener('click',()=>deleteEvent(event));meta.append(text,remove);card.append(imageButton,meta);box.appendChild(card);}}
-async function updateEvents(){try{const responses=await Promise.all([fetch('/api/events',{cache:'no-store'}),fetch('/api/road-events',{cache:'no-store'})]);const lists=await Promise.all(responses.map(response=>response.json()));renderEvents(lists[0],document.getElementById('events'),'No alerts yet');renderEvents(lists[1],document.getElementById('road-events'),'No passing vehicles captured yet');}catch(e){}}
-function selectArchive(view){const isDriveway=view==='driveway';const isRoad=view==='road';document.getElementById('driveway-panel').hidden=!isDriveway;document.getElementById('road-panel').hidden=!isRoad;document.getElementById('captures-panel').hidden=view!=='captures';for(const [id,active] of [['driveway-tab',isDriveway],['road-tab',isRoad],['captures-tab',view==='captures']]){const tab=document.getElementById(id);tab.classList.toggle('active',active);tab.setAttribute('aria-selected',String(active));}}
-document.getElementById('driveway-tab').addEventListener('click',()=>selectArchive('driveway'));document.getElementById('road-tab').addEventListener('click',()=>selectArchive('road'));document.getElementById('captures-tab').addEventListener('click',()=>selectArchive('captures'));
+function renderEvents(list,box,emptyText){box.replaceChildren();if(!list.length){const p=document.createElement('p');p.className='note';p.textContent=emptyText;box.appendChild(p);return;}for(const event of list){const card=document.createElement('article');card.className='event';const imageButton=document.createElement('button');imageButton.className='event-image';imageButton.type='button';imageButton.setAttribute('aria-label','Open '+eventName(event)+' event full screen');const img=document.createElement('img');img.src=event.snapshot;img.alt=eventName(event)+' event';imageButton.appendChild(img);imageButton.addEventListener('click',()=>openEvent(event));const meta=document.createElement('div');meta.className='meta';const text=document.createElement('div');text.className='meta-text';const name=document.createElement('strong');name.textContent=eventName(event)+' — '+Math.round(event.confidence*100)+'%';const time=document.createElement('small');time.textContent=new Date(event.timestamp).toLocaleString();text.append(name,time);const actions=document.createElement('div');actions.className='capture-actions';const download=document.createElement('a');download.className='download';download.href=event.snapshot;download.download='';download.title='Download image';download.setAttribute('aria-label','Download '+eventName(event)+' image');download.textContent='⬇️';const remove=document.createElement('button');remove.className='delete';remove.type='button';remove.title='Delete this event';remove.setAttribute('aria-label','Delete '+eventName(event)+' event');remove.textContent='🗑️';remove.addEventListener('click',()=>deleteEvent(event));actions.append(download,remove);meta.append(text,actions);card.append(imageButton,meta);box.appendChild(card);}}
+async function updateEvents(){try{const responses=await Promise.all([fetch('/api/events',{cache:'no-store'}),fetch('/api/road-events',{cache:'no-store'}),fetch('/api/wildlife-test-events',{cache:'no-store'})]);const lists=await Promise.all(responses.map(response=>response.json()));renderEvents(lists[0],document.getElementById('events'),'No alerts yet');renderEvents(lists[1],document.getElementById('road-events'),'No passing vehicles captured yet');renderEvents(lists[2],document.getElementById('wildlife-test-events'),'No wildlife candidates captured yet');}catch(e){}}
+function selectArchive(view){const isDriveway=view==='driveway';const isRoad=view==='road';const isWildlifeTest=view==='wildlife-test';document.getElementById('driveway-panel').hidden=!isDriveway;document.getElementById('road-panel').hidden=!isRoad;document.getElementById('wildlife-test-panel').hidden=!isWildlifeTest;document.getElementById('captures-panel').hidden=view!=='captures';for(const [id,active] of [['driveway-tab',isDriveway],['road-tab',isRoad],['wildlife-test-tab',isWildlifeTest],['captures-tab',view==='captures']]){const tab=document.getElementById(id);tab.classList.toggle('active',active);tab.setAttribute('aria-selected',String(active));}}
+document.getElementById('driveway-tab').addEventListener('click',()=>selectArchive('driveway'));document.getElementById('road-tab').addEventListener('click',()=>selectArchive('road'));document.getElementById('wildlife-test-tab').addEventListener('click',()=>selectArchive('wildlife-test'));document.getElementById('captures-tab').addEventListener('click',()=>selectArchive('captures'));
 refreshStreamPreference();update();updateEvents();updateManualCaptures();setInterval(update,1000);setInterval(updateEvents,5000);setInterval(updateManualCaptures,5000);
 </script>
 </body></html>)HTML";
@@ -1845,6 +1889,7 @@ void inference_loop() {
     double total_inference_ms = 0.0;
     unsigned long event_sequence = 0;
     unsigned long road_event_sequence = 0;
+    unsigned long wildlife_test_event_sequence = 0;
     unsigned long road_track_sequence = 0;
     std::vector<RoadTrack> road_tracks;
     std::map<std::string, Clock::time_point> active_classes;
@@ -1864,6 +1909,8 @@ void inference_loop() {
     cv::Rect_<float> cached_species_rect;
     auto cached_species_until = Clock::now();
     auto next_species_attempt = Clock::now();
+    auto last_wildlife_test_capture =
+        Clock::now() - std::chrono::hours(24);
 
     struct PresentDetection {
         const Object* object = nullptr;
@@ -2101,7 +2148,39 @@ void inference_loop() {
                 } else if (!config.animal_alerts_enabled) {
                     label << " test only";
                 }
-                detection_overlays.push_back({object.rect, label.str(), color});
+                const std::string overlay_label = label.str();
+                detection_overlays.push_back(
+                    {object.rect, overlay_label, color});
+                const double since_wildlife_test =
+                    std::chrono::duration<double>(
+                        Clock::now() - last_wildlife_test_capture).count();
+                if (config.wildlife_test_captures_enabled &&
+                    species.available &&
+                    since_wildlife_test >=
+                        config.wildlife_test_cooldown_seconds) {
+                    cv::Mat test_snapshot;
+                    frame.copyTo(test_snapshot);
+                    draw_detection_overlay(
+                        test_snapshot,
+                        {object.rect, overlay_label, color});
+                    std::string test_class = species_slug(species.label);
+                    if (!species_accepted) {
+                        test_class += "_rejected";
+                    }
+                    EventInfo test_event = create_wildlife_test_event(
+                        test_snapshot, test_class, species.confidence,
+                        ++wildlife_test_event_sequence);
+                    {
+                        std::lock_guard<std::mutex> lock(state.status_mutex);
+                        state.recent_wildlife_test_events.push_front(
+                            std::move(test_event));
+                        while (state.recent_wildlife_test_events.size() > 20) {
+                            state.recent_wildlife_test_events.pop_back();
+                        }
+                        ++state.wildlife_test_event_count;
+                    }
+                    last_wildlife_test_capture = Clock::now();
+                }
                 continue;
             }
 
@@ -2136,10 +2215,12 @@ void inference_loop() {
             }
             ++relevant_count;
             const std::string name = class_name(object.label);
-            const auto existing = present_classes.find(name);
-            if (existing == present_classes.end() ||
-                existing->second.event_confidence < object.prob) {
-                present_classes[name] = {&object, object.prob, name};
+            if (config.general_events_enabled) {
+                const auto existing = present_classes.find(name);
+                if (existing == present_classes.end() ||
+                    existing->second.event_confidence < object.prob) {
+                    present_classes[name] = {&object, object.prob, name};
+                }
             }
             std::ostringstream label;
             label << name << " " << std::fixed
@@ -2178,6 +2259,9 @@ void inference_loop() {
             }
 
             road_tracks.push_back({++road_track_sequence, detection.center, event_now, true});
+            if (!config.general_events_enabled) {
+                continue;
+            }
             const cv::Scalar road_color(210, 80, 210);
             std::ostringstream road_label;
             road_label << "road " << class_name(detection.object->label) << " "
@@ -2227,7 +2311,8 @@ void inference_loop() {
                 std::chrono::duration<double>(event_now - mailbox_stationary_since).count();
             const double since_mailbox_event =
                 std::chrono::duration<double>(event_now - mailbox_last_event).count();
-            if (!mailbox_alerted_this_visit &&
+            if (config.general_events_enabled &&
+                !mailbox_alerted_this_visit &&
                 mailbox_stationary_seconds >= config.mailbox_dwell_seconds &&
                 since_mailbox_event >= config.mailbox_cooldown_seconds) {
                 mailbox_alerted_this_visit = true;
@@ -2391,7 +2476,7 @@ void serve_archived_image(int client_socket, const std::string& archive_director
 }
 
 void serve_manual_capture(int client_socket, const std::string& kind,
-                          const std::string& filename) {
+                          const std::string& filename, bool download) {
     if (!manual_storage_ready() || !valid_manual_capture(kind, filename)) {
         send_text(client_socket, "text/plain", "Not found\n", "404 Not Found");
         return;
@@ -2410,7 +2495,8 @@ void serve_manual_capture(int client_socket, const std::string& kind,
     headers << "HTTP/1.1 200 OK\r\n"
             << "Content-Type: " << content_type << "\r\n"
             << "Content-Length: " << size << "\r\n"
-            << "Content-Disposition: attachment; filename=\""
+            << "Content-Disposition: "
+            << (download ? "attachment" : "inline") << "; filename=\""
             << filename << "\"\r\n"
             << "Cache-Control: private, no-store\r\n"
             << "Connection: close\r\n\r\n";
@@ -2577,6 +2663,16 @@ void handle_client(int client_socket) {
             send_text(client_socket, "application/json", "{\"deleted\":false}",
                       "404 Not Found");
         }
+    } else if (method == "DELETE" &&
+               path.rfind("/api/wildlife-test-events/", 0) == 0) {
+        const std::string event_id =
+            path.substr(std::strlen("/api/wildlife-test-events/"));
+        if (delete_wildlife_test_event(event_id)) {
+            send_text(client_socket, "application/json", "{\"deleted\":true}");
+        } else {
+            send_text(client_socket, "application/json", "{\"deleted\":false}",
+                      "404 Not Found");
+        }
     } else if (method == "DELETE" && path.rfind("/api/events/", 0) == 0) {
         const std::string event_id = path.substr(std::strlen("/api/events/"));
         if (delete_event(event_id)) {
@@ -2596,6 +2692,9 @@ void handle_client(int client_socket) {
         send_text(client_socket, "application/json", events_json());
     } else if (path == "/api/road-events") {
         send_text(client_socket, "application/json", road_events_json());
+    } else if (path == "/api/wildlife-test-events") {
+        send_text(
+            client_socket, "application/json", wildlife_test_events_json());
     } else if (path == "/api/manual-captures") {
         send_text(client_socket, "application/json", manual_captures_json());
     } else if (path == "/api/zones") {
@@ -2608,6 +2707,10 @@ void handle_client(int client_socket) {
     } else if (path.rfind("/road-events/", 0) == 0) {
         const std::string filename = path.substr(std::strlen("/road-events/"));
         serve_archived_image(client_socket, "road_events", filename);
+    } else if (path.rfind("/wildlife-test/", 0) == 0) {
+        const std::string filename =
+            path.substr(std::strlen("/wildlife-test/"));
+        serve_archived_image(client_socket, "wildlife_test", filename);
     } else if (path.rfind("/manual/", 0) == 0) {
         const std::string remainder =
             path.substr(std::strlen("/manual/"));
@@ -2615,7 +2718,9 @@ void handle_client(int client_socket) {
         const std::string kind = remainder.substr(0, separator);
         const std::string filename = separator == std::string::npos
             ? std::string{} : remainder.substr(separator + 1);
-        serve_manual_capture(client_socket, kind, filename);
+        serve_manual_capture(
+            client_socket, kind, filename,
+            query.find("preview=1") == std::string::npos);
     } else if (path == "/favicon.ico") {
         send_text(client_socket, "text/plain", "", "204 No Content");
     } else {
@@ -2698,6 +2803,8 @@ int main(int argc, char** argv) {
         environment_number("ANIMAL_CONFIDENCE_THRESHOLD", 0.35), 0.01, 0.99));
     config.animal_alerts_enabled =
         environment_flag("ANIMAL_ALERTS_ENABLED", true);
+    config.general_events_enabled =
+        environment_flag("GENERAL_EVENTS_ENABLED", true);
     config.wildlife_confidence_threshold = static_cast<float>(std::clamp(
         environment_number("WILDLIFE_CONFIDENCE_THRESHOLD", 0.20), 0.01, 0.99));
     config.nms_threshold = static_cast<float>(std::clamp(
@@ -2732,6 +2839,15 @@ int main(int argc, char** argv) {
     config.species_cache_seconds = std::clamp(
         environment_number("SPECIES_CACHE_SECONDS", 8.0),
         1.0, 60.0);
+    config.wildlife_test_captures_enabled =
+        environment_flag("WILDLIFE_TEST_CAPTURES_ENABLED", false);
+    config.wildlife_test_cooldown_seconds = std::clamp(
+        environment_number("WILDLIFE_TEST_COOLDOWN_SECONDS", 30.0),
+        5.0, 3600.0);
+    config.wildlife_test_snapshot_retention =
+        static_cast<std::size_t>(std::clamp(
+            environment_number("WILDLIFE_TEST_SNAPSHOT_RETENTION", 200.0),
+            1.0, 10000.0));
     const char* manual_storage_env = std::getenv("MANUAL_STORAGE_ROOT");
     if (manual_storage_env && *manual_storage_env) {
         config.manual_storage_root = manual_storage_env;
@@ -2764,6 +2880,7 @@ int main(int argc, char** argv) {
     default_zones = current_zones_locked();
     std::filesystem::create_directories(config.output_dir / "events");
     std::filesystem::create_directories(config.output_dir / "road_events");
+    std::filesystem::create_directories(config.output_dir / "wildlife_test");
     if (manual_storage_ready()) {
         std::filesystem::create_directories(manual_directory("snapshots"));
         std::filesystem::create_directories(manual_directory("videos"));

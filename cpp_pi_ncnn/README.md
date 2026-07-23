@@ -136,6 +136,22 @@ template. Adjust its account and paths to match the installation. Start with
 `ANIMAL_ALERTS_ENABLED=false`, verify the live overlay and `/api/status`, then
 enable animal events only after local false-positive testing.
 
+For unattended field testing, enable the separate local candidate archive:
+
+```dotenv
+WILDLIFE_TEST_CAPTURES_ENABLED=true
+WILDLIFE_TEST_COOLDOWN_SECONDS=30
+WILDLIFE_TEST_SNAPSHOT_RETENTION=200
+GENERAL_EVENTS_ENABLED=false
+```
+
+The **Wildlife test** dashboard tab shows labeled snapshots for both confirmed
+species and rejected candidates such as `no-species`. These test records never
+enter the alert archive or notification queue. Each archive image, manual
+snapshot, and manual video includes preview, download, and delete controls.
+Set `GENERAL_EVENTS_ENABLED=false` only on a dedicated wildlife Pi to avoid
+duplicating the primary Pi's driveway, mailbox, and road archives.
+
 Planned dashboard improvement: editable zone handles over the live image with
 Preview, Save, and Cancel controls, so the homeowner can redraw the boundary
 without editing coordinates or restarting from a terminal.

@@ -14,12 +14,14 @@ service.
 - mailbox stops: alerts only after a vehicle remains nearly stationary;
 - wildlife: one cooldown-controlled alert when the optional MegaDetector V6
   animal model finds wildlife in any configured boundary;
+- wildlife testing: a separate no-notification gallery can retain labeled
+  confirmed and rejected candidates while thresholds are being calibrated;
 - road traffic: a separate, no-alert archive with one snapshot per tracked
   passing vehicle;
 - ntfy notifications: optional text-only phone alerts for driveway, mailbox,
   and animal events;
 - local dashboard: live video, full-screen event images, archive tabs, and
-  confirmed deletion;
+  preview, download, and confirmed deletion controls;
 - headless service: designed to restart automatically on a Raspberry Pi.
 
 ## Start here
@@ -69,8 +71,9 @@ The detector does not reprocess a stale frame while the camera is offline.
 defaults to one pass per second, leaving the five-per-second road detector
 unchanged. If the wildlife model cannot load, the service keeps running and
 falls back to the standard COCO animal classes.
-Set `ANIMAL_ALERTS_ENABLED=false` to pause all animal detection, snapshots,
-and notifications while keeping people and vehicle monitoring active.
+Set `ANIMAL_ALERTS_ENABLED=false` to pause animal alert events and
+notifications while keeping people, vehicles, and the optional isolated
+wildlife-test gallery active.
 
 ## Hardware used for the reference build
 
