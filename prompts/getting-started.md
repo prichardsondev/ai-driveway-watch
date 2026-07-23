@@ -21,9 +21,10 @@ Make sure you have the following ready before asking the agent to begin:
 - The camera's local username and password, kept private and entered only on
   the Pi when prompted.
 
-If you do not have every item yet, tell me what you do have and I will explain
-what can be tested safely before we continue. Do not buy hardware or format
-storage without first confirming the exact model and disk.
+If you do not have every item yet, tell the AI assistant what you do have. The
+assistant should explain what can be tested safely before continuing. Do not
+buy hardware or format storage without first confirming the exact model and
+disk.
 
 Then walk me through the setup one step at a time. Do not assume I already
 know Linux, Raspberry Pi services, OpenCV, NCNN, RTSP, or Tailscale. Pause for
