@@ -1,0 +1,5 @@
+# Install CPU-only torch/torchvision/torchaudio from the PyTorch CPU index first.
+PytorchWildlife==1.3.0
+soundfile==0.14.0
+librosa==0.11.0
+setuptools<81

@@ -99,9 +99,42 @@ recommended Pi 5 starting point. The status API and dashboard show whether the
 model loaded and its most recent inference time. The weight and Ultralytics
 export are AGPL-3.0 licensed; the project-authored integration remains MIT.
 
-MegaDetector detects wildlife but does not name species. A later classifier
-can consume only accepted animal snapshots on a second Pi, preserving the
-camera Pi's live-stream performance and local-only image handling.
+MegaDetector detects wildlife but does not name species. The optional DFNE
+classifier provides a second stage tuned for northeastern North America. The
+C++ service sends only an in-memory JPEG crop to a localhost-only classifier;
+the crop is not written to disk or uploaded. Low-confidence, `no-species`, and
+human classifications are rejected before event creation.
+
+Install the classifier in an isolated environment. Install the CPU-only
+PyTorch packages first so pip does not download unusable NVIDIA libraries:
+
+```sh
+python3 -m venv .wildlife-venv
+.wildlife-venv/bin/python -m pip install --upgrade pip
+.wildlife-venv/bin/python -m pip install \
+  torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/cpu
+.wildlife-venv/bin/python -m pip install \
+  -r cpp_pi_ncnn/wildlife-classifier-requirements.txt
+```
+
+Run `wildlife_classifier.py` as a separate service and keep it bound to
+`127.0.0.1`. The first model load downloads the DFNE weights; subsequent
+classification stays local. Configure the C++ service with:
+
+```dotenv
+SPECIES_CLASSIFIER_ENABLED=true
+SPECIES_CLASSIFIER_REQUIRED=true
+SPECIES_CLASSIFIER_PORT=8765
+SPECIES_CONFIDENCE_THRESHOLD=0.65
+SPECIES_CLASSIFIER_TIMEOUT_SECONDS=8
+SPECIES_CACHE_SECONDS=8
+```
+
+`wildlife-classifier.service` is the `/opt/ai-driveway-watch` deployment
+template. Adjust its account and paths to match the installation. Start with
+`ANIMAL_ALERTS_ENABLED=false`, verify the live overlay and `/api/status`, then
+enable animal events only after local false-positive testing.
 
 Planned dashboard improvement: editable zone handles over the live image with
 Preview, Save, and Cancel controls, so the homeowner can redraw the boundary

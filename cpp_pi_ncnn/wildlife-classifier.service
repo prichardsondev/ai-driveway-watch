@@ -1,0 +1,21 @@
+[Unit]
+Description=AI Driveway Watch regional wildlife classifier
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=driveway-watch
+Group=driveway-watch
+WorkingDirectory=/opt/ai-driveway-watch/cpp_pi_ncnn
+ExecStart=/opt/ai-driveway-watch/.wildlife-venv/bin/python /opt/ai-driveway-watch/cpp_pi_ncnn/wildlife_classifier.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/ai-driveway-watch
+
+[Install]
+WantedBy=multi-user.target

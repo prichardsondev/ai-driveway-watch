@@ -64,6 +64,12 @@ struct ServiceConfig {
         "wildlife-model/model.ncnn.param";
     std::filesystem::path wildlife_model_path =
         "wildlife-model/model.ncnn.bin";
+    bool species_classifier_enabled = false;
+    bool species_classifier_required = true;
+    int species_classifier_port = 8765;
+    float species_confidence_threshold = 0.65f;
+    double species_classifier_timeout_seconds = 8.0;
+    double species_cache_seconds = 8.0;
     std::filesystem::path manual_storage_root =
         "/mnt/driveway-recordings";
     double manual_recording_seconds = 30.0;
@@ -126,6 +132,12 @@ struct SharedState {
     bool wildlife_model_ready = false;
     double wildlife_inference_ms = 0.0;
     unsigned long wildlife_inference_count = 0;
+    bool species_classifier_ready = false;
+    double species_inference_ms = 0.0;
+    unsigned long species_inference_count = 0;
+    std::string last_species;
+    double last_species_confidence = 0.0;
+    std::string species_classifier_error;
     unsigned long captured_frames = 0;
     unsigned long inference_count = 0;
     int relevant_objects = 0;
@@ -233,6 +245,131 @@ bool environment_flag(const char* name, bool fallback) {
         return false;
     }
     return fallback;
+}
+
+struct SpeciesResult {
+    bool available = false;
+    std::string label;
+    float confidence = 0.0f;
+    std::string error;
+};
+
+std::string species_slug(const std::string& label) {
+    std::string slug;
+    for (const unsigned char character : label) {
+        if (std::isalnum(character)) {
+            slug.push_back(static_cast<char>(std::tolower(character)));
+        } else if ((character == ' ' || character == '-' || character == '_') &&
+                   !slug.empty() && slug.back() != '_') {
+            slug.push_back('_');
+        }
+    }
+    while (!slug.empty() && slug.back() == '_') {
+        slug.pop_back();
+    }
+    return slug.empty() ? "wildlife" : slug;
+}
+
+bool rejected_species_label(const std::string& label) {
+    const std::string slug = species_slug(label);
+    return slug == "no_species" || slug == "human";
+}
+
+SpeciesResult classify_species_crop(const cv::Mat& crop) {
+    SpeciesResult result;
+    if (crop.empty()) {
+        result.error = "empty animal crop";
+        return result;
+    }
+    std::vector<unsigned char> jpeg;
+    if (!cv::imencode(
+            ".jpg", crop, jpeg, {cv::IMWRITE_JPEG_QUALITY, 90}) ||
+        jpeg.empty()) {
+        result.error = "could not encode animal crop";
+        return result;
+    }
+
+    const int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (socket_fd < 0) {
+        result.error = "could not create classifier socket";
+        return result;
+    }
+    const auto timeout_microseconds = static_cast<long>(
+        std::max(0.1, config.species_classifier_timeout_seconds) * 1e6);
+    timeval timeout{};
+    timeout.tv_sec = timeout_microseconds / 1000000;
+    timeout.tv_usec = timeout_microseconds % 1000000;
+    setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port =
+        htons(static_cast<uint16_t>(config.species_classifier_port));
+    inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+    if (connect(socket_fd, reinterpret_cast<sockaddr*>(&address),
+                sizeof(address)) != 0) {
+        close(socket_fd);
+        result.error = "regional classifier is not ready";
+        return result;
+    }
+
+    std::ostringstream request;
+    request << "POST /classify HTTP/1.1\r\n"
+            << "Host: 127.0.0.1\r\n"
+            << "Content-Type: image/jpeg\r\n"
+            << "Content-Length: " << jpeg.size() << "\r\n"
+            << "Connection: close\r\n\r\n";
+    const std::string headers = request.str();
+    if (!send_all(socket_fd, headers.data(), headers.size()) ||
+        !send_all(socket_fd, jpeg.data(), jpeg.size())) {
+        close(socket_fd);
+        result.error = "could not send crop to regional classifier";
+        return result;
+    }
+    shutdown(socket_fd, SHUT_WR);
+
+    std::string response;
+    std::array<char, 1024> buffer{};
+    while (response.size() < 16384) {
+        const ssize_t received = recv(
+            socket_fd, buffer.data(), buffer.size(), 0);
+        if (received <= 0) {
+            break;
+        }
+        response.append(buffer.data(), static_cast<std::size_t>(received));
+    }
+    close(socket_fd);
+    if (response.rfind("HTTP/1.0 200", 0) != 0 &&
+        response.rfind("HTTP/1.1 200", 0) != 0) {
+        result.error = "regional classifier rejected the crop";
+        return result;
+    }
+    const auto body_offset = response.find("\r\n\r\n");
+    if (body_offset == std::string::npos) {
+        result.error = "invalid regional classifier response";
+        return result;
+    }
+    const std::string body = response.substr(body_offset + 4);
+    const auto separator = body.find('\t');
+    if (separator == std::string::npos) {
+        result.error = "invalid regional classifier result";
+        return result;
+    }
+    result.label = body.substr(0, separator);
+    try {
+        result.confidence = std::stof(body.substr(separator + 1));
+    } catch (...) {
+        result.error = "invalid regional classifier confidence";
+        result.label.clear();
+        return result;
+    }
+    result.available = !result.label.empty() &&
+        std::isfinite(result.confidence);
+    if (!result.available) {
+        result.error = "empty regional classifier result";
+    }
+    return result;
 }
 
 bool valid_ntfy_topic(const std::string& topic) {
@@ -1243,6 +1380,18 @@ std::string status_json() {
          << (state.wildlife_model_ready ? "true" : "false")
          << ",\"wildlife_inference_ms\":" << state.wildlife_inference_ms
          << ",\"wildlife_inference_count\":" << state.wildlife_inference_count
+         << ",\"species_classifier_enabled\":"
+         << (config.species_classifier_enabled ? "true" : "false")
+         << ",\"species_classifier_ready\":"
+         << (state.species_classifier_ready ? "true" : "false")
+         << ",\"species_inference_ms\":" << state.species_inference_ms
+         << ",\"species_inference_count\":" << state.species_inference_count
+         << ",\"last_species\":\""
+         << json_escape(state.last_species) << "\""
+         << ",\"last_species_confidence\":"
+         << state.last_species_confidence
+         << ",\"species_classifier_error\":\""
+         << json_escape(state.species_classifier_error) << "\""
          << ",\"captured_frames\":" << state.captured_frames
          << ",\"inference_count\":" << state.inference_count
          << ",\"relevant_objects\":" << state.relevant_objects
@@ -1425,7 +1574,7 @@ async function update(){try{const r=await fetch('/api/status',{cache:'no-store'}
 document.getElementById('health').textContent=s.healthy?'Pi live':'Camera reconnecting';
 document.getElementById('camera').textContent=s.camera_fps.toFixed(1)+' FPS';
 document.getElementById('inference').textContent=s.inference_ms.toFixed(0)+' ms';
-document.getElementById('wildlife').textContent=!s.wildlife_enabled?'Off':!s.wildlife_model_ready?'Unavailable':s.wildlife_inference_count?s.wildlife_inference_ms.toFixed(0)+' ms':'Ready';
+document.getElementById('wildlife').textContent=!s.wildlife_enabled?'Off':!s.wildlife_model_ready?'Detector unavailable':s.species_classifier_enabled&&!s.species_classifier_ready?'Classifier starting':s.last_species?s.last_species+' '+(s.last_species_confidence*100).toFixed(0)+'%':s.wildlife_inference_count?s.wildlife_inference_ms.toFixed(0)+' ms':'Ready';
 document.getElementById('objects').textContent=s.relevant_objects;
 document.getElementById('frames').textContent=s.captured_frames.toLocaleString();
 const recordingWasActive=recordingActive;
@@ -1682,7 +1831,7 @@ void inference_loop() {
     detector.load(640);
     WildlifeDetector wildlife_detector;
     bool wildlife_ready = false;
-    if (config.wildlife_model_enabled && config.animal_alerts_enabled) {
+    if (config.wildlife_model_enabled) {
         wildlife_ready = wildlife_detector.load(
             config.wildlife_param_path, config.wildlife_model_path, 640) == 0;
         if (!wildlife_ready) {
@@ -1711,6 +1860,16 @@ void inference_loop() {
     unsigned long last_processed_generation = 0;
     std::vector<Object> cached_wildlife;
     auto next_wildlife_inference = Clock::now();
+    SpeciesResult cached_species;
+    cv::Rect_<float> cached_species_rect;
+    auto cached_species_until = Clock::now();
+    auto next_species_attempt = Clock::now();
+
+    struct PresentDetection {
+        const Object* object = nullptr;
+        float event_confidence = 0.0f;
+        std::string event_name;
+    };
 
     while (running.load()) {
         const auto cycle_start = Clock::now();
@@ -1787,12 +1946,9 @@ void inference_loop() {
         cv::Point2f mailbox_vehicle_center;
         std::vector<RoadDetection> road_detections;
         std::vector<DetectionOverlay> detection_overlays;
-        std::map<std::string, const Object*> present_classes;
+        std::map<std::string, PresentDetection> present_classes;
         for (const auto& object : objects) {
             if (!relevant_class(object.label)) {
-                continue;
-            }
-            if (!config.animal_alerts_enabled && animal_class(object.label)) {
                 continue;
             }
             if (object.label == 0) {
@@ -1823,24 +1979,128 @@ void inference_loop() {
                 if (!inside_driveway && !inside_mailbox && !inside_road) {
                     continue;
                 }
-                ++relevant_count;
-                const auto existing = present_classes.find("animal");
-                if (existing == present_classes.end() ||
-                    existing->second->prob < object.prob) {
-                    present_classes["animal"] = &object;
+                SpeciesResult species;
+                if (object.label == 80 && config.species_classifier_enabled) {
+                    const cv::Rect_<float> intersection =
+                        object.rect & cached_species_rect;
+                    const float union_area = object.rect.area() +
+                        cached_species_rect.area() - intersection.area();
+                    const float overlap = union_area > 0.0f
+                        ? intersection.area() / union_area : 0.0f;
+                    const auto species_now = Clock::now();
+                    if (cached_species.available &&
+                        species_now < cached_species_until &&
+                        overlap >= 0.25f) {
+                        species = cached_species;
+                    } else if (species_now >= next_species_attempt) {
+                        const float padding_x = object.rect.width * 0.12f;
+                        const float padding_y = object.rect.height * 0.12f;
+                        const int crop_x = std::max(
+                            0, static_cast<int>(std::floor(
+                                   object.rect.x - padding_x)));
+                        const int crop_y = std::max(
+                            0, static_cast<int>(std::floor(
+                                   object.rect.y - padding_y)));
+                        const int crop_right = std::min(
+                            frame.cols, static_cast<int>(std::ceil(
+                                object.rect.x + object.rect.width + padding_x)));
+                        const int crop_bottom = std::min(
+                            frame.rows, static_cast<int>(std::ceil(
+                                object.rect.y + object.rect.height + padding_y)));
+                        const auto species_started = Clock::now();
+                        if (crop_right > crop_x && crop_bottom > crop_y) {
+                            species = classify_species_crop(frame(
+                                cv::Rect(crop_x, crop_y,
+                                         crop_right - crop_x,
+                                         crop_bottom - crop_y)));
+                        } else {
+                            species.error = "invalid animal crop";
+                        }
+                        const double species_ms =
+                            std::chrono::duration<double, std::milli>(
+                                Clock::now() - species_started).count();
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                state.status_mutex);
+                            state.species_classifier_ready =
+                                species.available;
+                            state.species_inference_ms = species_ms;
+                            ++state.species_inference_count;
+                            state.species_classifier_error = species.error;
+                            if (species.available) {
+                                state.last_species = species.label;
+                                state.last_species_confidence =
+                                    species.confidence;
+                            }
+                        }
+                        next_species_attempt = species_now +
+                            std::chrono::seconds(
+                                species.available ? 1 : 5);
+                        if (species.available) {
+                            cached_species = species;
+                            cached_species_rect = object.rect;
+                            cached_species_until = species_now +
+                                std::chrono::duration_cast<Clock::duration>(
+                                    std::chrono::duration<double>(
+                                        config.species_cache_seconds));
+                        }
+                    }
                 }
-                const cv::Scalar color = inside_driveway
+
+                const bool species_accepted =
+                    !config.species_classifier_enabled ||
+                    (species.available &&
+                     species.confidence >=
+                         config.species_confidence_threshold &&
+                     !rejected_species_label(species.label));
+                const bool confirmed = species_accepted ||
+                    !config.species_classifier_required;
+                if (confirmed) {
+                    ++relevant_count;
+                }
+                std::string event_name = "animal_" +
+                    std::string(class_name(object.label));
+                float event_confidence = object.prob;
+                if (species_accepted &&
+                    config.species_classifier_enabled) {
+                    event_name = "animal_" + species_slug(species.label);
+                    event_confidence = species.confidence;
+                }
+                if (confirmed && config.animal_alerts_enabled) {
+                    const auto existing = present_classes.find(event_name);
+                    if (existing == present_classes.end() ||
+                        existing->second.event_confidence <
+                            event_confidence) {
+                        present_classes[event_name] = {
+                            &object, event_confidence, event_name};
+                    }
+                }
+                const cv::Scalar color = !confirmed
+                    ? cv::Scalar(130, 130, 130)
+                    : (inside_driveway
                     ? cv::Scalar(65, 229, 141)
                     : (inside_mailbox ? cv::Scalar(0, 185, 255)
-                                      : cv::Scalar(210, 80, 210));
+                                      : cv::Scalar(210, 80, 210)));
                 std::ostringstream label;
-                if (object.label == 80) {
+                if (species.available &&
+                    config.species_classifier_enabled) {
+                    label << species.label << " " << std::fixed
+                          << std::setprecision(0)
+                          << species.confidence * 100.0f << "% / detector ";
+                } else if (config.species_classifier_enabled) {
+                    label << "wildlife candidate ";
+                } else if (object.label == 80) {
                     label << "wildlife ";
                 } else {
                     label << "animal " << class_name(object.label) << " ";
                 }
                 label << std::fixed
                       << std::setprecision(0) << object.prob * 100.0f << "%";
+                if (!confirmed) {
+                    label << " rejected";
+                } else if (!config.animal_alerts_enabled) {
+                    label << " test only";
+                }
                 detection_overlays.push_back({object.rect, label.str(), color});
                 continue;
             }
@@ -1878,8 +2138,8 @@ void inference_loop() {
             const std::string name = class_name(object.label);
             const auto existing = present_classes.find(name);
             if (existing == present_classes.end() ||
-                existing->second->prob < object.prob) {
-                present_classes[name] = &object;
+                existing->second.event_confidence < object.prob) {
+                present_classes[name] = {&object, object.prob, name};
             }
             std::ostringstream label;
             label << name << " " << std::fixed
@@ -2001,7 +2261,7 @@ void inference_loop() {
                 ++iterator;
             }
         }
-        for (const auto& [name, object] : present_classes) {
+        for (const auto& [name, present] : present_classes) {
             const bool was_active = active_classes.find(name) != active_classes.end();
             active_classes[name] = event_now;
             const auto previous_event = last_event_by_class.find(name);
@@ -2012,10 +2272,9 @@ void inference_loop() {
                 continue;
             }
             last_event_by_class[name] = event_now;
-            const std::string event_name = name == "animal"
-                ? "animal_" + std::string(class_name(object->label)) : name;
             EventInfo event = create_event(
-                frame, event_name, object->prob, ++event_sequence);
+                frame, present.event_name, present.event_confidence,
+                ++event_sequence);
             queue_notification(event);
             {
                 std::lock_guard<std::mutex> lock(state.status_mutex);
@@ -2457,6 +2716,22 @@ int main(int argc, char** argv) {
     if (wildlife_model_env && *wildlife_model_env) {
         config.wildlife_model_path = wildlife_model_env;
     }
+    config.species_classifier_enabled =
+        environment_flag("SPECIES_CLASSIFIER_ENABLED", false);
+    config.species_classifier_required =
+        environment_flag("SPECIES_CLASSIFIER_REQUIRED", true);
+    config.species_classifier_port = static_cast<int>(std::clamp(
+        environment_number("SPECIES_CLASSIFIER_PORT", 8765.0),
+        1024.0, 65535.0));
+    config.species_confidence_threshold = static_cast<float>(std::clamp(
+        environment_number("SPECIES_CONFIDENCE_THRESHOLD", 0.65),
+        0.01, 0.99));
+    config.species_classifier_timeout_seconds = std::clamp(
+        environment_number("SPECIES_CLASSIFIER_TIMEOUT_SECONDS", 8.0),
+        1.0, 30.0);
+    config.species_cache_seconds = std::clamp(
+        environment_number("SPECIES_CACHE_SECONDS", 8.0),
+        1.0, 60.0);
     const char* manual_storage_env = std::getenv("MANUAL_STORAGE_ROOT");
     if (manual_storage_env && *manual_storage_env) {
         config.manual_storage_root = manual_storage_env;

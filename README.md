@@ -161,8 +161,10 @@ tests/         Python prototype tests
 - The service does not identify people, license plates, or whether a vehicle
   truly belongs to a mail carrier.
 - MegaDetector V6 distinguishes animals from people and vehicles but does not
-  identify species. Species naming is intentionally a separate, optional
-  classifier stage so it can run on another Pi without slowing camera capture.
+  identify species. The optional localhost-only DFNE stage classifies accepted
+  crops for northeastern North America and rejects low-confidence,
+  `no-species`, and human results before an event is created. It can run on a
+  second Pi without slowing camera capture.
 - Without the optional wildlife model, animal alerts use the standard COCO
   animal classes except zebra and giraffe, which are ignored because they
   produced repeatable flag false positives in the reference view.

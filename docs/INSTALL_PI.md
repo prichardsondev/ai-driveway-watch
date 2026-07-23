@@ -53,6 +53,19 @@ curl --fail http://127.0.0.1:8000/api/status
 
 Open `http://PI_ADDRESS:8000/` from the trusted LAN and verify all overlays.
 
+## Optional regional wildlife classifier
+
+The two-stage wildlife path uses the compact NCNN MegaDetector as a fast gate
+and a persistent DFNE classifier for northeastern North American species.
+Follow the classifier installation in
+[`cpp_pi_ncnn/README.md`](../cpp_pi_ncnn/README.md), install
+`wildlife-classifier.service`, and keep it listening only on
+`127.0.0.1:8765`.
+
+Leave `ANIMAL_ALERTS_ENABLED=false` during initial testing. Confirm
+`species_classifier_ready`, the last species label and confidence, and a zero
+event count through `/api/status` before enabling animal events.
+
 ## Rollback
 
 Keep the previously working binary or source before updating. To stop and
