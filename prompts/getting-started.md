@@ -2,11 +2,6 @@
 
 ## What you need
 
-Start by checking whether the repository is already present. If it is not,
-clone it from:
-
-`https://github.com/prichardsondev/ai-driveway-watch`
-
 Make sure you have these items ready before starting:
 
 - A Raspberry Pi (Pi 5 recommended) with Raspberry Pi OS, power, and network
@@ -27,7 +22,12 @@ storage without first confirming the exact model and disk.
 
 Copy and paste everything below as one prompt:
 
-I want to set up AI Driveway Watch from this repository on my Raspberry Pi.
+I want to set up AI Driveway Watch on my Raspberry Pi.
+
+First, check whether the repository is already present on the Pi. If it is
+not, download or clone it from:
+
+https://github.com/prichardsondev/ai-driveway-watch
 
 Then walk me through the setup one step at a time. Do not assume I already
 know Linux, Raspberry Pi services, OpenCV, NCNN, RTSP, or Tailscale. Pause for
