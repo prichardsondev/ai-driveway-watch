@@ -7,9 +7,9 @@ clone it from:
 
 `https://github.com/prichardsondev/ai-driveway-watch`
 
-## What you need before starting
+## Before you start: make sure you have these things
 
-Have these items ready:
+Make sure you have the following ready before asking the agent to begin:
 
 - A Raspberry Pi (Pi 5 recommended) with Raspberry Pi OS, power, and network
   access.
