@@ -16,7 +16,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/ai-driveway-watch/cpp_pi_ncnn/runtime
+ReadWritePaths=/opt/ai-driveway-watch/cpp_pi_ncnn/runtime /mnt/driveway-recordings
 
 [Install]
 WantedBy=multi-user.target

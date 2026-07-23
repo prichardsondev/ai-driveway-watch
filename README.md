@@ -2,8 +2,9 @@
 
 An agent-friendly, local-first driveway and roadside camera monitor for a
 Raspberry Pi 5. It decodes one RTSP/RTSPS stream with OpenCV 5, runs YOLOv8n
-through Tencent NCNN, and serves a phone-friendly dashboard without sending
-video to a cloud vision service.
+and an optional camera-trap-trained wildlife detector through Tencent NCNN,
+and serves a phone-friendly dashboard without sending video to a cloud vision
+service.
 
 ![Driveway Watch dashboard with configurable detection zones](docs/images/driveway-watch-dashboard.jpg)
 
@@ -11,8 +12,8 @@ video to a cloud vision service.
 
 - driveway arrivals: person and vehicle snapshots with configurable cooldowns;
 - mailbox stops: alerts only after a vehicle remains nearly stationary;
-- animals: one cooldown-controlled alert when a supported animal enters any
-  configured boundary;
+- wildlife: one cooldown-controlled alert when the optional MegaDetector V6
+  animal model finds wildlife in any configured boundary;
 - road traffic: a separate, no-alert archive with one snapshot per tracked
   passing vehicle;
 - ntfy notifications: optional text-only phone alerts for driveway, mailbox,
@@ -20,6 +21,19 @@ video to a cloud vision service.
 - local dashboard: live video, full-screen event images, archive tabs, and
   confirmed deletion;
 - headless service: designed to restart automatically on a Raspberry Pi.
+
+## Start here
+
+For a new installation, begin with the [Pi installation guide](docs/INSTALL_PI.md).
+The optional, plain-language starter prompts are collected here:
+
+- [Calibrate camera zones](prompts/calibrate-zones.md)
+- [Diagnose a missed detection](prompts/diagnose-missed-detections.md)
+- [Add a notification integration](prompts/add-notification-integration.md)
+
+`AGENTS.md` is the contributor and deployment safety guide; it is not required
+for normal camera use. The prompts above are the practical starting points for
+calibration and troubleshooting.
 
 The colored polygons are configured as normalized `x,y` points:
 
@@ -37,10 +51,25 @@ Each phone or browser can independently hide the colored boundary lines. The
 display preference is stored only in that browser and never changes detection,
 alerts, or the saved zone configuration.
 
+The dashboard can download a current JPEG, a 3- or 5-frame burst, or a
+native video clip that defaults to 30 seconds and can be stopped early. Manual
+captures are saved locally to `MANUAL_STORAGE_ROOT` on the recording SSD, then
+appear in the dashboard for download or confirmed deletion. They never enter
+the event or notification queues. Video is copied from the native camera
+stream, so the phone does not need to remain open while recording.
+
 `DETECTION_FPS` controls how often the detector examines a frame independently
 of the camera and dashboard stream rate. Start at `5`; a cooled Raspberry Pi 5
 can often run `8` comfortably. Increase it only while inference time remains
 well below the frame interval and the Pi reports no thermal throttling.
+`RECONNECT_DELAY_SECONDS` controls the pause between failed camera sessions.
+The detector does not reprocess a stale frame while the camera is offline.
+`WILDLIFE_DETECTION_FPS` independently controls the camera-trap model and
+defaults to one pass per second, leaving the five-per-second road detector
+unchanged. If the wildlife model cannot load, the service keeps running and
+falls back to the standard COCO animal classes.
+Set `ANIMAL_ALERTS_ENABLED=false` to pause all animal detection, snapshots,
+and notifications while keeping people and vehicle monitoring active.
 
 ## Hardware used for the reference build
 
@@ -48,6 +77,10 @@ well below the frame interval and the Pi reports no thermal throttling.
 - 1280x720, 30 FPS RTSPS camera stream;
 - NVMe storage;
 - OpenCV 5 and Tencent NCNN installed in isolated prefixes.
+
+The reference camera is the [Reolink CX810 4K UHD PoE Security
+Camera](https://www.amazon.com/dp/B0CX1QCQNX). This is a non-affiliate reference
+link supplied by the project owner; the project receives no commission.
 
 The reference Pi sustained five detections per second while decoding the live
 stream at full frame rate. See [the measured results](cpp_pi_ncnn/README.md).
@@ -124,13 +157,14 @@ tests/         Python prototype tests
 ## Privacy and limitations
 
 - A random public ntfy topic is a bearer secret, not full authentication.
-- The service classifies common COCO objects; it does not identify people,
-  license plates, or whether a vehicle truly belongs to a mail carrier.
-- Animal alerts enable the standard COCO animal classes except zebra and
-  giraffe, which are ignored because they produced repeatable flag false
-  positives in the reference view. The model has no dedicated deer class, so
-  wildlife may be reported as the closest enabled animal or occasionally
-  missed.
+- The service does not identify people, license plates, or whether a vehicle
+  truly belongs to a mail carrier.
+- MegaDetector V6 distinguishes animals from people and vehicles but does not
+  identify species. Species naming is intentionally a separate, optional
+  classifier stage so it can run on another Pi without slowing camera capture.
+- Without the optional wildlife model, animal alerts use the standard COCO
+  animal classes except zebra and giraffe, which are ignored because they
+  produced repeatable flag false positives in the reference view.
 - Mailbox alerts intentionally say “vehicle stopped near mailbox.”
 - Comply with local camera, audio, notice, and data-retention laws.
 

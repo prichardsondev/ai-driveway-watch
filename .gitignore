@@ -12,6 +12,7 @@ cpp_pi_ncnn/yoloV8.h
 cpp_pi_ncnn/yolov8n.bin
 cpp_pi_ncnn/yolov8n.param
 cpp_pi_ncnn/LICENSE.qengineering
+cpp_pi_ncnn/wildlife-model/
 *.jpg
 *.jpeg
 *.png

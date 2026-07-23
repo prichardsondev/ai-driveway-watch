@@ -1,4 +1,5 @@
 #include "yoloV8.h"
+#include "wildlifeDetector.h"
 
 #include <opencv2/geometry/2d.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -6,13 +7,16 @@
 #include <opencv2/videoio.hpp>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cctype>
@@ -50,8 +54,23 @@ struct ServiceConfig {
     float confidence_threshold = 0.40f;
     float person_confidence_threshold = 0.25f;
     float animal_confidence_threshold = 0.35f;
+    bool animal_alerts_enabled = true;
+    float wildlife_confidence_threshold = 0.20f;
     float nms_threshold = 0.50f;
     double detection_fps = 5.0;
+    bool wildlife_model_enabled = false;
+    double wildlife_detection_fps = 1.0;
+    std::filesystem::path wildlife_param_path =
+        "wildlife-model/model.ncnn.param";
+    std::filesystem::path wildlife_model_path =
+        "wildlife-model/model.ncnn.bin";
+    std::filesystem::path manual_storage_root =
+        "/mnt/driveway-recordings";
+    double manual_recording_seconds = 30.0;
+    double manual_storage_max_gb = 200.0;
+    double manual_storage_min_free_gb = 10.0;
+    std::string camera_url;
+    double reconnect_delay_seconds = 2.0;
     std::filesystem::path output_dir = "runtime";
     std::size_t snapshot_retention = 200;
     std::string ntfy_server;
@@ -96,6 +115,7 @@ struct SharedState {
     cv::Mat latest_frame;
     std::vector<unsigned char> latest_jpeg;
     std::vector<unsigned char> latest_clean_jpeg;
+    unsigned long frame_generation = 0;
     unsigned long jpeg_generation = 0;
 
     std::mutex status_mutex;
@@ -103,6 +123,9 @@ struct SharedState {
     double camera_fps = 0.0;
     double inference_ms = 0.0;
     double average_inference_ms = 0.0;
+    bool wildlife_model_ready = false;
+    double wildlife_inference_ms = 0.0;
+    unsigned long wildlife_inference_count = 0;
     unsigned long captured_frames = 0;
     unsigned long inference_count = 0;
     int relevant_objects = 0;
@@ -121,6 +144,14 @@ struct SharedState {
 
 SharedState state;
 std::atomic<unsigned int> clean_stream_clients{0};
+std::atomic<unsigned long> manual_capture_sequence{0};
+std::mutex manual_capture_mutex;
+std::mutex manual_recording_mutex;
+bool manual_recording_active = false;
+pid_t manual_recording_pid = -1;
+Clock::time_point manual_recording_started;
+std::string manual_recording_filename;
+std::string manual_recording_error;
 std::mutex events_mutex;
 std::mutex notification_mutex;
 std::condition_variable notification_ready;
@@ -181,6 +212,27 @@ double environment_number(const char* name, double fallback) {
     char* end = nullptr;
     const double parsed = std::strtod(value, &end);
     return end != value ? parsed : fallback;
+}
+
+bool environment_flag(const char* name, bool fallback) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return fallback;
+    }
+    std::string normalized(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char character) {
+                       return static_cast<char>(std::tolower(character));
+                   });
+    if (normalized == "1" || normalized == "true" ||
+        normalized == "yes" || normalized == "on") {
+        return true;
+    }
+    if (normalized == "0" || normalized == "false" ||
+        normalized == "no" || normalized == "off") {
+        return false;
+    }
+    return fallback;
 }
 
 bool valid_ntfy_topic(const std::string& topic) {
@@ -618,6 +670,339 @@ std::string utc_timestamp(std::string* filename_timestamp = nullptr) {
     return display.str();
 }
 
+std::filesystem::path manual_directory(const std::string& kind = "") {
+    auto directory = config.manual_storage_root / "manual";
+    return kind.empty() ? directory : directory / kind;
+}
+
+bool manual_storage_ready() {
+    struct stat storage_status{};
+    struct stat parent_status{};
+    const auto root = config.manual_storage_root;
+    if (root.empty() || root == root.root_path() ||
+        ::stat(root.c_str(), &storage_status) != 0 ||
+        ::stat(root.parent_path().c_str(), &parent_status) != 0) {
+        return false;
+    }
+    return S_ISDIR(storage_status.st_mode) &&
+           storage_status.st_dev != parent_status.st_dev;
+}
+
+std::string manual_capture_filename(const std::string& kind,
+                                    const std::string& extension) {
+    std::string timestamp;
+    utc_timestamp(&timestamp);
+    const auto milliseconds =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto sequence = ++manual_capture_sequence;
+    return "manual-" + kind + "-" + timestamp + "-" +
+           std::to_string(milliseconds % 1000) + "-" +
+           std::to_string(sequence) + extension;
+}
+
+bool valid_manual_capture(const std::string& kind, const std::string& filename) {
+    if ((kind != "snapshots" && kind != "videos") ||
+        filename.empty() || filename.find('/') != std::string::npos ||
+        filename.find("..") != std::string::npos ||
+        filename.rfind("manual-", 0) != 0) {
+        return false;
+    }
+    const auto extension = std::filesystem::path(filename).extension();
+    return (kind == "snapshots" && extension == ".jpg") ||
+           (kind == "videos" && extension == ".mp4");
+}
+
+void enforce_manual_retention() {
+    if (!manual_storage_ready()) {
+        return;
+    }
+    std::vector<std::filesystem::directory_entry> captures;
+    std::uintmax_t total_bytes = 0;
+    std::error_code error;
+    for (const std::string kind : {"snapshots", "videos"}) {
+        for (const auto& entry :
+             std::filesystem::directory_iterator(manual_directory(kind), error)) {
+            if (!entry.is_regular_file(error) || entry.is_symlink(error)) {
+                continue;
+            }
+            const auto extension = entry.path().extension();
+            if (extension != ".jpg" && extension != ".mp4") {
+                continue;
+            }
+            total_bytes += entry.file_size(error);
+            captures.push_back(entry);
+        }
+        error.clear();
+    }
+    std::sort(captures.begin(), captures.end(),
+              [](const auto& left, const auto& right) {
+                  return left.last_write_time() < right.last_write_time();
+              });
+    const std::uintmax_t max_bytes = static_cast<std::uintmax_t>(
+        config.manual_storage_max_gb * 1024.0 * 1024.0 * 1024.0);
+    const std::uintmax_t minimum_free = static_cast<std::uintmax_t>(
+        config.manual_storage_min_free_gb * 1024.0 * 1024.0 * 1024.0);
+    auto space = std::filesystem::space(config.manual_storage_root, error);
+    if (error) {
+        return;
+    }
+    std::uintmax_t available = space.available;
+    for (const auto& capture : captures) {
+        if (total_bytes <= max_bytes && available >= minimum_free) {
+            break;
+        }
+        const auto size = capture.file_size(error);
+        error.clear();
+        if (std::filesystem::remove(capture.path(), error) && !error) {
+            total_bytes = size <= total_bytes ? total_bytes - size : 0;
+            available += size;
+        }
+        error.clear();
+    }
+}
+
+int save_manual_snapshots(int requested_count, std::string& error_message) {
+    if (!manual_storage_ready()) {
+        error_message = "Recording SSD is not mounted.";
+        return 0;
+    }
+    const int count =
+        requested_count == 3 || requested_count == 5 ? requested_count : 1;
+    std::lock_guard<std::mutex> capture_lock(manual_capture_mutex);
+    std::error_code error;
+    std::filesystem::create_directories(manual_directory("snapshots"), error);
+    if (error) {
+        error_message = "Snapshot directory is unavailable.";
+        return 0;
+    }
+
+    int saved = 0;
+    for (int index = 0; index < count; ++index) {
+        cv::Mat frame;
+        {
+            std::lock_guard<std::mutex> frame_lock(state.frame_mutex);
+            if (!state.latest_frame.empty()) {
+                state.latest_frame.copyTo(frame);
+            }
+        }
+        if (frame.empty()) {
+            error_message = "The current camera frame is not ready.";
+            break;
+        }
+        std::vector<unsigned char> encoded;
+        try {
+            if (!cv::imencode(
+                    ".jpg", frame, encoded,
+                    {cv::IMWRITE_JPEG_QUALITY, 92})) {
+                error_message = "The current camera frame could not be encoded.";
+                break;
+            }
+        } catch (const cv::Exception&) {
+            error_message = "The current camera frame could not be encoded.";
+            break;
+        }
+        const auto final_path = manual_directory("snapshots") /
+            manual_capture_filename("snapshot", ".jpg");
+        std::ofstream output(final_path, std::ios::binary | std::ios::trunc);
+        output.write(reinterpret_cast<const char*>(encoded.data()),
+                     static_cast<std::streamsize>(encoded.size()));
+        output.close();
+        std::error_code file_error;
+        const bool saved_file = std::filesystem::is_regular_file(
+            final_path, file_error) && !file_error &&
+            std::filesystem::file_size(final_path, file_error) > 0 && !file_error;
+        if (!output.good() || !saved_file) {
+            std::error_code cleanup_error;
+            std::filesystem::remove(final_path, cleanup_error);
+            error_message = "The snapshot could not be written to the SSD.";
+            break;
+        }
+        ++saved;
+        if (index + 1 < count) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        }
+    }
+    enforce_manual_retention();
+    return saved;
+}
+
+bool start_manual_recording(std::string& error_message) {
+    if (!manual_storage_ready()) {
+        error_message = "Recording SSD is not mounted.";
+        return false;
+    }
+    if (config.camera_url.empty()) {
+        error_message = "Camera stream is unavailable.";
+        return false;
+    }
+    std::lock_guard<std::mutex> recording_lock(manual_recording_mutex);
+    if (manual_recording_active) {
+        error_message = "A recording is already active.";
+        return false;
+    }
+
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(
+        manual_directory("videos"), filesystem_error);
+    if (filesystem_error) {
+        error_message = "Video directory is unavailable.";
+        return false;
+    }
+    const std::string filename =
+        manual_capture_filename("recording", ".mp4");
+    const auto final_path = manual_directory("videos") / filename;
+    auto temporary_path = final_path;
+    temporary_path += ".part";
+    const std::string duration =
+        std::to_string(static_cast<int>(std::lround(
+            config.manual_recording_seconds)));
+    const std::string output = temporary_path.string();
+
+    const pid_t child = fork();
+    if (child == 0) {
+        const int null_fd = open("/dev/null", O_WRONLY);
+        if (null_fd >= 0) {
+            dup2(null_fd, STDOUT_FILENO);
+            dup2(null_fd, STDERR_FILENO);
+            close(null_fd);
+        }
+        execl("/usr/bin/ffmpeg", "ffmpeg",
+              "-nostdin", "-hide_banner", "-loglevel", "error",
+              "-rtsp_transport", "tcp", "-i", config.camera_url.c_str(),
+              "-t", duration.c_str(), "-map", "0:v:0",
+              "-c:v", "copy", "-an", "-movflags", "+faststart",
+              "-f", "mp4", "-y", output.c_str(),
+              static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    if (child < 0) {
+        error_message = "The recorder process could not start.";
+        return false;
+    }
+
+    manual_recording_active = true;
+    manual_recording_pid = child;
+    manual_recording_started = Clock::now();
+    manual_recording_filename = filename;
+    manual_recording_error.clear();
+    std::thread([child, temporary_path, final_path]() {
+        int status = 0;
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+        }
+        std::error_code error;
+        const bool has_video =
+            std::filesystem::exists(temporary_path, error) &&
+            std::filesystem::file_size(temporary_path, error) > 0;
+        bool saved_video = false;
+        if (has_video) {
+            std::filesystem::rename(temporary_path, final_path, error);
+            saved_video = !error;
+        }
+        if (!saved_video) {
+            error.clear();
+            std::filesystem::remove(temporary_path, error);
+        } else {
+            std::lock_guard<std::mutex> capture_lock(manual_capture_mutex);
+            enforce_manual_retention();
+        }
+        std::lock_guard<std::mutex> lock(manual_recording_mutex);
+        if (manual_recording_pid == child) {
+            manual_recording_active = false;
+            manual_recording_pid = -1;
+            if (!saved_video) {
+                manual_recording_error = "Recording failed before a video was saved.";
+            } else {
+                manual_recording_error.clear();
+            }
+        }
+    }).detach();
+    return true;
+}
+
+bool stop_manual_recording(std::string& error_message) {
+    std::lock_guard<std::mutex> lock(manual_recording_mutex);
+    if (!manual_recording_active || manual_recording_pid <= 0) {
+        error_message = "No recording is active.";
+        return false;
+    }
+    if (kill(manual_recording_pid, SIGINT) != 0) {
+        error_message = "The recorder could not be stopped.";
+        return false;
+    }
+    return true;
+}
+
+std::string manual_captures_json() {
+    std::lock_guard<std::mutex> capture_lock(manual_capture_mutex);
+    struct ManualFile {
+        std::string kind;
+        std::string filename;
+        std::uintmax_t size = 0;
+        std::filesystem::file_time_type modified;
+    };
+    std::vector<ManualFile> files;
+    std::error_code error;
+    if (manual_storage_ready()) {
+        for (const std::string kind : {"snapshots", "videos"}) {
+            for (const auto& entry :
+                 std::filesystem::directory_iterator(manual_directory(kind), error)) {
+                if (!entry.is_regular_file(error) || entry.is_symlink(error) ||
+                    !valid_manual_capture(kind, entry.path().filename().string())) {
+                    continue;
+                }
+                files.push_back({
+                    kind, entry.path().filename().string(),
+                    entry.file_size(error), entry.last_write_time(error)});
+            }
+            error.clear();
+        }
+    }
+    std::sort(files.begin(), files.end(),
+              [](const ManualFile& left, const ManualFile& right) {
+                  return left.modified > right.modified;
+              });
+    if (files.size() > 100) {
+        files.resize(100);
+    }
+    std::ostringstream json;
+    json << '[';
+    for (std::size_t index = 0; index < files.size(); ++index) {
+        if (index) {
+            json << ',';
+        }
+        const auto& file = files[index];
+        const auto system_time =
+            std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                file.modified - std::filesystem::file_time_type::clock::now() +
+                std::chrono::system_clock::now());
+        const auto epoch_millis =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                system_time.time_since_epoch()).count();
+        json << "{\"kind\":\"" << file.kind
+             << "\",\"name\":\"" << json_escape(file.filename)
+             << "\",\"size_bytes\":" << file.size
+             << ",\"timestamp_ms\":" << epoch_millis
+             << ",\"url\":\"/manual/" << file.kind << "/"
+             << json_escape(file.filename)
+             << "\",\"delete_path\":\"/api/manual-captures/"
+             << file.kind << "/" << json_escape(file.filename) << "\"}";
+    }
+    json << ']';
+    return json.str();
+}
+
+bool delete_manual_capture(const std::string& kind,
+                           const std::string& filename) {
+    if (!manual_storage_ready() || !valid_manual_capture(kind, filename)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> capture_lock(manual_capture_mutex);
+    std::error_code error;
+    return std::filesystem::remove(
+        manual_directory(kind) / filename, error) && !error;
+}
+
 void enforce_snapshot_retention(const std::filesystem::path& events_dir,
                                 std::size_t retention) {
     std::vector<std::filesystem::directory_entry> snapshots;
@@ -820,6 +1205,31 @@ std::string status_json() {
         std::lock_guard<std::mutex> zone_lock(zones_mutex);
         mailbox_zone_enabled = !config.mailbox_zone.empty();
     }
+    const bool storage_ready = manual_storage_ready();
+    double storage_free_gb = 0.0;
+    if (storage_ready) {
+        std::error_code error;
+        const auto space = std::filesystem::space(
+            config.manual_storage_root, error);
+        if (!error) {
+            storage_free_gb =
+                space.available / (1024.0 * 1024.0 * 1024.0);
+        }
+    }
+    bool recording_active = false;
+    double recording_elapsed = 0.0;
+    std::string recording_filename;
+    std::string recording_error;
+    {
+        std::lock_guard<std::mutex> recording_lock(manual_recording_mutex);
+        recording_active = manual_recording_active;
+        recording_filename = manual_recording_filename;
+        recording_error = manual_recording_error;
+        if (recording_active) {
+            recording_elapsed = std::chrono::duration<double>(
+                Clock::now() - manual_recording_started).count();
+        }
+    }
     std::lock_guard<std::mutex> lock(state.status_mutex);
     std::ostringstream json;
     json << std::fixed << std::setprecision(1)
@@ -827,6 +1237,12 @@ std::string status_json() {
          << ",\"camera_fps\":" << state.camera_fps
          << ",\"inference_ms\":" << state.inference_ms
          << ",\"average_inference_ms\":" << state.average_inference_ms
+         << ",\"wildlife_enabled\":"
+         << (config.wildlife_model_enabled ? "true" : "false")
+         << ",\"wildlife_model_ready\":"
+         << (state.wildlife_model_ready ? "true" : "false")
+         << ",\"wildlife_inference_ms\":" << state.wildlife_inference_ms
+         << ",\"wildlife_inference_count\":" << state.wildlife_inference_count
          << ",\"captured_frames\":" << state.captured_frames
          << ",\"inference_count\":" << state.inference_count
          << ",\"relevant_objects\":" << state.relevant_objects
@@ -837,6 +1253,17 @@ std::string status_json() {
          << ",\"mailbox_stationary_seconds\":" << state.mailbox_stationary_seconds
          << ",\"event_count\":" << state.event_count
          << ",\"road_event_count\":" << state.road_event_count
+         << ",\"manual_storage_ready\":"
+         << (storage_ready ? "true" : "false")
+         << ",\"manual_storage_free_gb\":" << storage_free_gb
+         << ",\"manual_recording_active\":"
+         << (recording_active ? "true" : "false")
+         << ",\"manual_recording_elapsed\":" << recording_elapsed
+         << ",\"manual_recording_seconds\":" << config.manual_recording_seconds
+         << ",\"manual_recording_filename\":\""
+         << json_escape(recording_filename) << "\""
+         << ",\"manual_recording_error\":\""
+         << json_escape(recording_error) << "\""
          << ",\"notification_enabled\":" << (ntfy_enabled() ? "true" : "false")
          << ",\"notification_count\":" << state.notification_count
          << ",\"notification_error\":\"" << json_escape(state.notification_error) << "\""
@@ -890,9 +1317,10 @@ const char* dashboard_html = R"HTML(<!doctype html>
 header,main{width:min(1120px,94vw);margin:auto}header{display:flex;align-items:center;justify-content:space-between;padding:24px 0 16px}
 h1,h2,p{margin:0}.live{display:flex;align-items:center;gap:8px;color:#a9f5cf}.dot{width:10px;height:10px;border-radius:50%;background:#40e58d;box-shadow:0 0 14px #40e58d}
 .video{position:relative;overflow:hidden;border:1px solid #315c4b;border-radius:18px;background:#020504;box-shadow:0 20px 70px #0008}.video img{display:block;width:100%;aspect-ratio:16/9;object-fit:contain}.boundary-canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair;touch-action:none}
+.capture-controls{display:flex;align-items:end;flex-wrap:wrap;gap:10px}.capture-controls .field{min-width:120px}.capture-status{min-height:1.5em;margin-top:12px;color:#a9f5cf}.manual-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:18px;padding-top:16px;border-top:1px solid #29483d}.manual-heading h3{margin:0;font-size:1rem}.manual-list{display:grid;gap:8px;margin-top:10px}.manual-capture{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-radius:10px;background:#183126}.manual-link{min-width:0;color:#a9f5cf;text-decoration:none}.manual-link strong,.manual-link small{display:block}.manual-link strong{overflow:hidden;text-overflow:ellipsis}.manual-link small{margin-top:3px;color:#91b7a5}.button:disabled{cursor:not-allowed;opacity:.55}
 .panel{margin:18px 0;padding:20px;border:1px solid #29483d;border-radius:16px;background:#102219dd}.panel h2{font-size:1.1rem;margin-bottom:16px}
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.stat{padding:14px;border-radius:12px;background:#183126}.label{font-size:.78rem;color:#91b7a5;text-transform:uppercase;letter-spacing:.06em}.value{font-size:1.25rem;margin-top:5px}
-.tabs{display:flex;gap:8px;margin:18px 0}.tab{flex:1;padding:13px;border:1px solid #315c4b;border-radius:12px;background:#102219;color:#a9c7ba;font-weight:700;cursor:pointer}.tab.active{background:#24513d;color:#fff;border-color:#4d9a75}[hidden]{display:none!important}.events{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}.event{overflow:hidden;border-radius:12px;background:#183126}.event-image{display:block;width:100%;padding:0;border:0;background:#07100d;cursor:zoom-in}.event-image img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover}.meta{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px}.meta-text{min-width:0}.event strong{display:block;text-transform:capitalize}.event small{color:#91b7a5}.delete{display:grid;place-items:center;flex:0 0 42px;width:42px;height:42px;border:1px solid #70433f;border-radius:10px;background:#3b2422;color:#ffd4cf;font-size:1.15rem;cursor:pointer}.delete:hover{background:#60302c}.note{color:#a9c7ba;line-height:1.5}.boundary-summary{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:12px}.boundary-buttons{display:flex;gap:8px}.button{min-height:44px;padding:10px 15px;border:1px solid #4d9a75;border-radius:10px;background:#24513d;color:#fff;font-weight:700;cursor:pointer}.button.secondary{border-color:#527065;background:#183126}.button.danger{border-color:#70433f;background:#3b2422;color:#ffd4cf}.editor-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{display:grid;gap:7px;color:#a9c7ba;font-size:.85rem}.field select,.field input{width:100%;min-height:44px;padding:9px 11px;border:1px solid #527065;border-radius:10px;background:#07100d;color:#fff;font:inherit}.editor-tools,.editor-save{display:flex;flex-wrap:wrap;gap:9px;margin-top:14px}.editor-save{justify-content:flex-end;padding-top:14px;border-top:1px solid #29483d}.point-status{margin-top:12px;color:#a9f5cf}.save-status{min-height:1.5em;margin-top:10px}.save-status.error{color:#ffb3aa}.save-status.success{color:#a9f5cf}dialog.viewer{width:100vw;height:100vh;max-width:none;max-height:none;margin:0;padding:70px 18px 18px;border:0;background:#020504f2;color:#edf8f3}.viewer::backdrop{background:#000d}.viewer img{display:block;width:100%;height:calc(100vh - 110px);object-fit:contain}.viewer-bar{position:fixed;z-index:2;top:0;left:0;right:0;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px;background:#07100df2}.viewer-actions{display:flex;gap:8px}.viewer-close{display:grid;place-items:center;width:44px;height:44px;border:1px solid #527065;border-radius:10px;background:#183126;color:#fff;font-size:1.6rem;cursor:pointer}@media(max-width:720px){.stats{grid-template-columns:repeat(2,1fr)}.editor-grid{grid-template-columns:1fr}.boundary-summary{align-items:flex-start;flex-direction:column}.boundary-buttons{width:100%}.boundary-buttons .button{flex:1}.editor-save .button{flex:1}}
+.tabs{display:flex;gap:8px;margin:18px 0}.tab{flex:1;padding:13px;border:1px solid #315c4b;border-radius:12px;background:#102219;color:#a9c7ba;font-weight:700;cursor:pointer}.tab.active{background:#24513d;color:#fff;border-color:#4d9a75}[hidden]{display:none!important}.events{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}.event{overflow:hidden;border-radius:12px;background:#183126}.event-image{display:block;width:100%;padding:0;border:0;background:#07100d;cursor:zoom-in}.event-image img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover}.meta{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px}.meta-text{min-width:0}.event strong{display:block;text-transform:capitalize}.event small{color:#91b7a5}.delete{display:grid;place-items:center;flex:0 0 42px;width:42px;height:42px;border:1px solid #70433f;border-radius:10px;background:#3b2422;color:#ffd4cf;font-size:1.15rem;cursor:pointer}.delete:hover{background:#60302c}.note{color:#a9c7ba;line-height:1.5}.boundary-summary{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:12px}.boundary-buttons{display:flex;gap:8px}.button{min-height:44px;padding:10px 15px;border:1px solid #4d9a75;border-radius:10px;background:#24513d;color:#fff;font-weight:700;cursor:pointer}.button.secondary{border-color:#527065;background:#183126}.button.danger{border-color:#70433f;background:#3b2422;color:#ffd4cf}.editor-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{display:grid;gap:7px;color:#a9c7ba;font-size:.85rem}.field select,.field input{width:100%;min-height:44px;padding:9px 11px;border:1px solid #527065;border-radius:10px;background:#07100d;color:#fff;font:inherit}.editor-tools,.editor-save{display:flex;flex-wrap:wrap;gap:9px;margin-top:14px}.editor-save{justify-content:flex-end;padding-top:14px;border-top:1px solid #29483d}.point-status{margin-top:12px;color:#a9f5cf}.save-status{min-height:1.5em;margin-top:10px}.save-status.error{color:#ffb3aa}.save-status.success{color:#a9f5cf}dialog.viewer{width:100vw;height:100vh;max-width:none;max-height:none;margin:0;padding:70px 18px 18px;border:0;background:#020504f2;color:#edf8f3}.viewer::backdrop{background:#000d}.viewer img{display:block;width:100%;height:calc(100vh - 110px);object-fit:contain}.viewer-bar{position:fixed;z-index:2;top:0;left:0;right:0;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px;background:#07100df2}.viewer-actions{display:flex;gap:8px}.viewer-close{display:grid;place-items:center;width:44px;height:44px;border:1px solid #527065;border-radius:10px;background:#183126;color:#fff;font-size:1.6rem;cursor:pointer}@media(max-width:720px){.stats{grid-template-columns:repeat(2,1fr)}.editor-grid{grid-template-columns:1fr}.boundary-summary{align-items:flex-start;flex-direction:column}.boundary-buttons{width:100%}.boundary-buttons .button{flex:1}.capture-controls{align-items:stretch}.capture-controls .field,.capture-controls .button{flex:1 1 140px}.editor-save .button{flex:1}}
 </style>
 </head>
 <body>
@@ -900,6 +1328,16 @@ h1,h2,p{margin:0}.live{display:flex;align-items:center;gap:8px;color:#a9f5cf}.do
 <main>
 <div class="video"><img id="live-stream" src="/stream.mjpg" alt="Live driveway camera from Raspberry Pi"><canvas class="boundary-canvas" id="boundary-canvas" hidden aria-label="Boundary drawing area"></canvas></div>
 <div class="boundary-summary"><p class="note">Blue: driveway arrival. Amber: mailbox stop. Purple: passing road traffic.</p><div class="boundary-buttons"><button class="button secondary" id="toggle-boundaries" type="button">Hide boundaries</button><button class="button secondary" id="edit-boundaries" type="button">Edit boundaries</button></div></div>
+<section class="panel" aria-labelledby="manual-capture-heading">
+<h2 id="manual-capture-heading">Manual capture</h2>
+<div class="capture-controls">
+<button class="button" id="snapshot-button" type="button">Save snapshot</button>
+<label class="field">Burst<select id="snapshot-burst"><option value="1">1 photo</option><option value="3">3 photos</option><option value="5">5 photos</option></select></label>
+<button class="button secondary" id="record-button" type="button" aria-pressed="false">Record 30 seconds</button>
+</div>
+<p class="capture-status" id="capture-status" role="status">Captures save at full camera quality to the recording SSD.</p>
+<p class="note" id="manual-storage">Checking SSD…</p>
+</section>
 <section class="panel" id="boundary-editor" hidden>
 <h2>Boundary editor</h2>
 <p class="note">Choose a type, press “Redraw this boundary,” then tap around the area. Nothing changes until you save.</p>
@@ -915,12 +1353,14 @@ h1,h2,p{margin:0}.live{display:flex;align-items:center;gap:8px;color:#a9f5cf}.do
 <section class="panel"><h2>Raspberry Pi NCNN preview</h2><div class="stats">
 <div class="stat"><div class="label">Camera</div><div class="value" id="camera">—</div></div>
 <div class="stat"><div class="label">Detection</div><div class="value" id="inference">—</div></div>
+<div class="stat"><div class="label">Wildlife</div><div class="value" id="wildlife">—</div></div>
 <div class="stat"><div class="label">Objects now</div><div class="value" id="objects">—</div></div>
 <div class="stat"><div class="label">Frames</div><div class="value" id="frames">—</div></div>
 </div></section>
-<div class="tabs" role="tablist" aria-label="Event archive"><button class="tab active" id="driveway-tab" type="button" role="tab" aria-selected="true">Alerts (<span id="driveway-count">0</span>)</button><button class="tab" id="road-tab" type="button" role="tab" aria-selected="false">Road traffic (<span id="road-count">0</span>)</button></div>
+<div class="tabs" role="tablist" aria-label="Event archive"><button class="tab active" id="driveway-tab" type="button" role="tab" aria-selected="true">Alerts (<span id="driveway-count">0</span>)</button><button class="tab" id="road-tab" type="button" role="tab" aria-selected="false">Road traffic (<span id="road-count">0</span>)</button><button class="tab" id="captures-tab" type="button" role="tab" aria-selected="false">Captures (<span id="captures-count">0</span>)</button></div>
 <div id="driveway-panel" role="tabpanel"><section class="panel"><h2>Recent alerts</h2><div class="events" id="events"><p class="note">No alerts yet</p></div></section><section class="panel"><h2>Notifications</h2><p class="note" id="notifications">Checking phone alerts…</p></section></div>
 <div id="road-panel" role="tabpanel" hidden><section class="panel"><h2>Road traffic archive</h2><p class="note" style="margin-bottom:16px">Passing vehicle snapshots do not send alerts. Animals inside any boundary do.</p><div class="events" id="road-events"><p class="note">No passing vehicles captured yet</p></div></section></div>
+<div id="captures-panel" role="tabpanel" hidden><section class="panel"><h2>Saved captures</h2><div class="manual-list" id="manual-captures"><p class="note">No manual captures yet</p></div></section></div>
 </main>
 <dialog class="viewer" id="viewer" aria-labelledby="viewer-caption">
 <div class="viewer-bar"><strong id="viewer-caption">Driveway event</strong><div class="viewer-actions"><button class="delete" id="viewer-delete" type="button" aria-label="Delete this event" title="Delete this event">🗑️</button><button class="viewer-close" id="viewer-close" type="button" aria-label="Close full-screen image">×</button></div></div>
@@ -944,8 +1384,16 @@ let baselineZones=[];
 let workingZones=[];
 let redrawing=false;
 let boundariesVisible=true;
+let recordingActive=false;
 try{boundariesVisible=localStorage.getItem('driveway-boundaries-visible')!=='false';}catch(error){}
 function refreshStreamPreference(){toggleBoundaries.textContent=boundariesVisible?'Hide boundaries':'Show boundaries';toggleBoundaries.setAttribute('aria-pressed',String(!boundariesVisible));liveStream.src='/stream.mjpg?boundaries='+(boundariesVisible?'1':'0')+'&session='+Date.now();}
+async function saveSnapshotBurst(){const button=document.getElementById('snapshot-button');const status=document.getElementById('capture-status');const count=Number(document.getElementById('snapshot-burst').value)||1;button.disabled=true;status.textContent='Saving '+count+' snapshot'+(count===1?'':'s')+' to SSD…';try{const response=await fetch('/api/manual/snapshots?count='+count,{method:'POST'});const data=await response.json();if(!response.ok)throw new Error(data.error||'Snapshot failed.');status.textContent='Saved '+data.saved+' full-resolution snapshot'+(data.saved===1?'':'s')+' to the SSD.';await updateManualCaptures();}catch(error){status.textContent=error.message;}finally{button.disabled=false;}}
+async function toggleManualRecording(){const button=document.getElementById('record-button');const status=document.getElementById('capture-status');button.disabled=true;try{const action=recordingActive?'stop':'start';const response=await fetch('/api/manual/recordings/'+action,{method:'POST'});const data=await response.json();if(!response.ok)throw new Error(data.error||'Recording command failed.');status.textContent=recordingActive?'Stopping and finishing the video…':'Recording camera-native video to SSD. You may close this page.';await update();}catch(error){status.textContent=error.message;}finally{button.disabled=false;}}
+function formatBytes(bytes){if(bytes<1024)return bytes+' B';if(bytes<1024*1024)return (bytes/1024).toFixed(1)+' KB';if(bytes<1024*1024*1024)return (bytes/(1024*1024)).toFixed(1)+' MB';return (bytes/(1024*1024*1024)).toFixed(1)+' GB';}
+async function deleteManualCapture(item){if(!confirm('Delete this '+(item.kind==='videos'?'video':'snapshot')+' from the recording SSD?'))return;const response=await fetch(item.delete_path,{method:'DELETE'});if(response.ok)await updateManualCaptures();}
+async function updateManualCaptures(){const box=document.getElementById('manual-captures');try{const response=await fetch('/api/manual-captures',{cache:'no-store'});const captures=await response.json();document.getElementById('captures-count').textContent=captures.length.toLocaleString();box.replaceChildren();if(!captures.length){const empty=document.createElement('p');empty.className='note';empty.textContent='No manual captures yet';box.appendChild(empty);return;}for(const item of captures){const row=document.createElement('div');row.className='manual-capture';const link=document.createElement('a');link.className='manual-link';link.href=item.url;link.download=item.name;const title=document.createElement('strong');title.textContent=item.kind==='videos'?'Video recording':'Snapshot';const details=document.createElement('small');details.textContent=new Date(item.timestamp_ms).toLocaleString()+' · '+formatBytes(item.size_bytes)+' · tap to download';link.append(title,details);const remove=document.createElement('button');remove.className='delete';remove.type='button';remove.title='Delete capture';remove.setAttribute('aria-label','Delete manual capture');remove.textContent='🗑️';remove.addEventListener('click',()=>deleteManualCapture(item));row.append(link,remove);box.appendChild(row);}}catch(error){document.getElementById('captures-count').textContent='—';box.innerHTML='<p class="note">Saved captures are temporarily unavailable.</p>';}}
+document.getElementById('snapshot-button').addEventListener('click',saveSnapshotBurst);
+document.getElementById('record-button').addEventListener('click',toggleManualRecording);
 function cloneZones(zones){return JSON.parse(JSON.stringify(zones));}
 function selectedZone(){return workingZones.find(zone=>zone.id===zoneType.value);}
 function resizeBoundaryCanvas(){const rectangle=liveStream.getBoundingClientRect();boundaryCanvas.width=Math.max(1,Math.round(rectangle.width));boundaryCanvas.height=Math.max(1,Math.round(rectangle.height));drawBoundaries();}
@@ -977,8 +1425,21 @@ async function update(){try{const r=await fetch('/api/status',{cache:'no-store'}
 document.getElementById('health').textContent=s.healthy?'Pi live':'Camera reconnecting';
 document.getElementById('camera').textContent=s.camera_fps.toFixed(1)+' FPS';
 document.getElementById('inference').textContent=s.inference_ms.toFixed(0)+' ms';
+document.getElementById('wildlife').textContent=!s.wildlife_enabled?'Off':!s.wildlife_model_ready?'Unavailable':s.wildlife_inference_count?s.wildlife_inference_ms.toFixed(0)+' ms':'Ready';
 document.getElementById('objects').textContent=s.relevant_objects;
 document.getElementById('frames').textContent=s.captured_frames.toLocaleString();
+const recordingWasActive=recordingActive;
+recordingActive=s.manual_recording_active;
+const recordButton=document.getElementById('record-button');
+const captureStatus=document.getElementById('capture-status');
+recordButton.textContent=recordingActive?'Stop recording':'Record 30 seconds';
+recordButton.classList.toggle('danger',recordingActive);
+recordButton.classList.toggle('secondary',!recordingActive);
+recordButton.setAttribute('aria-pressed',String(recordingActive));
+document.getElementById('manual-storage').textContent=s.manual_storage_ready?s.manual_storage_free_gb.toFixed(0)+' GB free':'SSD unavailable';
+if(recordingActive)captureStatus.textContent='Recording… '+Math.min(Math.round(s.manual_recording_seconds),Math.floor(s.manual_recording_elapsed))+' of '+Math.round(s.manual_recording_seconds)+' seconds. You may close this page.';
+else if(s.manual_recording_error)captureStatus.textContent=s.manual_recording_error;
+else if(recordingWasActive){captureStatus.textContent='Recording saved to the SSD.';updateManualCaptures();}
 document.getElementById('driveway-count').textContent=s.event_count.toLocaleString();
 document.getElementById('road-count').textContent=s.road_event_count.toLocaleString();
 const n=document.getElementById('notifications');
@@ -987,14 +1448,14 @@ else if(s.notification_error)n.textContent='Phone alerts need attention: '+s.not
 else n.textContent='ntfy phone alerts are active. '+s.notification_count+' event alert'+(s.notification_count===1?' has':'s have')+' been sent since this service started.';}catch(e){document.getElementById('health').textContent='Reconnecting';}}
 function renderEvents(list,box,emptyText){box.replaceChildren();if(!list.length){const p=document.createElement('p');p.className='note';p.textContent=emptyText;box.appendChild(p);return;}for(const event of list){const card=document.createElement('article');card.className='event';const imageButton=document.createElement('button');imageButton.className='event-image';imageButton.type='button';imageButton.setAttribute('aria-label','Open '+eventName(event)+' event full screen');const img=document.createElement('img');img.src=event.snapshot;img.alt=eventName(event)+' event';imageButton.appendChild(img);imageButton.addEventListener('click',()=>openEvent(event));const meta=document.createElement('div');meta.className='meta';const text=document.createElement('div');text.className='meta-text';const name=document.createElement('strong');name.textContent=eventName(event)+' — '+Math.round(event.confidence*100)+'%';const time=document.createElement('small');time.textContent=new Date(event.timestamp).toLocaleString();text.append(name,time);const remove=document.createElement('button');remove.className='delete';remove.type='button';remove.title='Delete this event';remove.setAttribute('aria-label','Delete '+eventName(event)+' event');remove.textContent='🗑️';remove.addEventListener('click',()=>deleteEvent(event));meta.append(text,remove);card.append(imageButton,meta);box.appendChild(card);}}
 async function updateEvents(){try{const responses=await Promise.all([fetch('/api/events',{cache:'no-store'}),fetch('/api/road-events',{cache:'no-store'})]);const lists=await Promise.all(responses.map(response=>response.json()));renderEvents(lists[0],document.getElementById('events'),'No alerts yet');renderEvents(lists[1],document.getElementById('road-events'),'No passing vehicles captured yet');}catch(e){}}
-function selectArchive(road){document.getElementById('driveway-panel').hidden=road;document.getElementById('road-panel').hidden=!road;const drivewayTab=document.getElementById('driveway-tab');const roadTab=document.getElementById('road-tab');drivewayTab.classList.toggle('active',!road);roadTab.classList.toggle('active',road);drivewayTab.setAttribute('aria-selected',String(!road));roadTab.setAttribute('aria-selected',String(road));}
-document.getElementById('driveway-tab').addEventListener('click',()=>selectArchive(false));document.getElementById('road-tab').addEventListener('click',()=>selectArchive(true));
-refreshStreamPreference();update();updateEvents();setInterval(update,1000);setInterval(updateEvents,5000);
+function selectArchive(view){const isDriveway=view==='driveway';const isRoad=view==='road';document.getElementById('driveway-panel').hidden=!isDriveway;document.getElementById('road-panel').hidden=!isRoad;document.getElementById('captures-panel').hidden=view!=='captures';for(const [id,active] of [['driveway-tab',isDriveway],['road-tab',isRoad],['captures-tab',view==='captures']]){const tab=document.getElementById(id);tab.classList.toggle('active',active);tab.setAttribute('aria-selected',String(active));}}
+document.getElementById('driveway-tab').addEventListener('click',()=>selectArchive('driveway'));document.getElementById('road-tab').addEventListener('click',()=>selectArchive('road'));document.getElementById('captures-tab').addEventListener('click',()=>selectArchive('captures'));
+refreshStreamPreference();update();updateEvents();updateManualCaptures();setInterval(update,1000);setInterval(updateEvents,5000);setInterval(updateManualCaptures,5000);
 </script>
 </body></html>)HTML";
 
 bool animal_class(int label) {
-    return label >= 14 && label <= 21;
+    return (label >= 14 && label <= 21) || label == 80;
 }
 
 bool relevant_class(int label) {
@@ -1053,6 +1514,7 @@ const char* class_name(int label) {
         case 21: return "bear";
         case 22: return "zebra";
         case 23: return "giraffe";
+        case 80: return "wildlife";
         default: return "object";
     }
 }
@@ -1144,6 +1606,23 @@ void draw_zone_boundaries(cv::Mat& frame, const ZoneSettings& zones) {
     }
 }
 
+void mark_camera_disconnected(const std::string& error) {
+    std::lock_guard<std::mutex> lock(state.status_mutex);
+    state.camera_connected = false;
+    state.camera_fps = 0.0;
+    state.last_error = error;
+}
+
+void wait_for_reconnect_delay() {
+    const auto delay = std::chrono::duration<double>(
+        config.reconnect_delay_seconds);
+    const auto deadline =
+        Clock::now() + std::chrono::duration_cast<Clock::duration>(delay);
+    while (running.load() && Clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
 void capture_loop(const std::string& camera_url) {
     while (running.load()) {
         cv::VideoCapture capture;
@@ -1152,28 +1631,26 @@ void capture_loop(const std::string& camera_url) {
             cv::CAP_PROP_READ_TIMEOUT_MSEC, 3000,
         };
         if (!capture.open(camera_url, cv::CAP_FFMPEG, options)) {
-            {
-                std::lock_guard<std::mutex> lock(state.status_mutex);
-                state.camera_connected = false;
-                state.last_error = "Could not open camera";
-            }
-            std::this_thread::sleep_for(std::chrono::seconds(2));
+            mark_camera_disconnected("Could not open camera; reconnecting");
+            wait_for_reconnect_delay();
             continue;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(state.status_mutex);
-            state.camera_connected = true;
-            state.last_error.clear();
         }
 
         unsigned long interval_frames = 0;
         auto interval_start = Clock::now();
+        bool received_frame = false;
         cv::Mat frame;
         while (running.load() && capture.read(frame) && !frame.empty()) {
+            if (!received_frame) {
+                std::lock_guard<std::mutex> lock(state.status_mutex);
+                state.camera_connected = true;
+                state.last_error.clear();
+                received_frame = true;
+            }
             {
                 std::lock_guard<std::mutex> lock(state.frame_mutex);
                 frame.copyTo(state.latest_frame);
+                ++state.frame_generation;
             }
             ++interval_frames;
             {
@@ -1192,17 +1669,30 @@ void capture_loop(const std::string& camera_url) {
         }
 
         capture.release();
-        {
-            std::lock_guard<std::mutex> lock(state.status_mutex);
-            state.camera_connected = false;
-            state.last_error = "Camera stream interrupted; reconnecting";
+        if (!running.load()) {
+            break;
         }
+        mark_camera_disconnected("Camera stream interrupted; reconnecting");
+        wait_for_reconnect_delay();
     }
 }
 
 void inference_loop() {
     YoloV8 detector;
     detector.load(640);
+    WildlifeDetector wildlife_detector;
+    bool wildlife_ready = false;
+    if (config.wildlife_model_enabled && config.animal_alerts_enabled) {
+        wildlife_ready = wildlife_detector.load(
+            config.wildlife_param_path, config.wildlife_model_path, 640) == 0;
+        if (!wildlife_ready) {
+            std::cerr << "Wildlife model unavailable; using the standard animal classes\n";
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(state.status_mutex);
+        state.wildlife_model_ready = wildlife_ready;
+    }
     double total_inference_ms = 0.0;
     unsigned long event_sequence = 0;
     unsigned long road_event_sequence = 0;
@@ -1218,14 +1708,19 @@ void inference_loop() {
     auto mailbox_last_event = Clock::now() - std::chrono::hours(24);
     float mailbox_best_confidence = 0.0f;
     const std::vector<int> jpeg_options = {cv::IMWRITE_JPEG_QUALITY, 82};
+    unsigned long last_processed_generation = 0;
+    std::vector<Object> cached_wildlife;
+    auto next_wildlife_inference = Clock::now();
 
     while (running.load()) {
         const auto cycle_start = Clock::now();
         cv::Mat frame;
         {
             std::lock_guard<std::mutex> lock(state.frame_mutex);
-            if (!state.latest_frame.empty()) {
+            if (!state.latest_frame.empty() &&
+                state.frame_generation != last_processed_generation) {
                 state.latest_frame.copyTo(frame);
+                last_processed_generation = state.frame_generation;
             }
         }
         if (frame.empty()) {
@@ -1247,7 +1742,43 @@ void inference_loop() {
                                   config.animal_confidence_threshold}),
                         config.nms_threshold);
         const double inference_ms =
-            std::chrono::duration<double, std::milli>(Clock::now() - inference_start).count();
+            std::chrono::duration<double, std::milli>(
+                Clock::now() - inference_start).count();
+        if (wildlife_ready) {
+            objects.erase(
+                std::remove_if(objects.begin(), objects.end(),
+                               [](const Object& object) {
+                                   return animal_class(object.label);
+                               }),
+                objects.end());
+            const auto wildlife_now = Clock::now();
+            if (wildlife_now >= next_wildlife_inference) {
+                const auto wildlife_started = Clock::now();
+                std::vector<Object> detected_wildlife;
+                if (wildlife_detector.detect(
+                        frame, detected_wildlife,
+                        config.wildlife_confidence_threshold,
+                        config.nms_threshold) == 0) {
+                    cached_wildlife = std::move(detected_wildlife);
+                }
+                const double wildlife_ms =
+                    std::chrono::duration<double, std::milli>(
+                        Clock::now() - wildlife_started).count();
+                {
+                    std::lock_guard<std::mutex> lock(state.status_mutex);
+                    state.wildlife_inference_ms = wildlife_ms;
+                    ++state.wildlife_inference_count;
+                }
+                const auto wildlife_interval = std::chrono::duration<double>(
+                    1.0 / config.wildlife_detection_fps);
+                next_wildlife_inference =
+                    wildlife_now +
+                    std::chrono::duration_cast<Clock::duration>(
+                        wildlife_interval);
+            }
+            objects.insert(
+                objects.end(), cached_wildlife.begin(), cached_wildlife.end());
+        }
 
         int relevant_count = 0;
         double best_person_confidence = 0.0;
@@ -1261,6 +1792,9 @@ void inference_loop() {
             if (!relevant_class(object.label)) {
                 continue;
             }
+            if (!config.animal_alerts_enabled && animal_class(object.label)) {
+                continue;
+            }
             if (object.label == 0) {
                 best_person_confidence = std::max(
                     best_person_confidence, static_cast<double>(object.prob));
@@ -1268,7 +1802,9 @@ void inference_loop() {
             const float required_confidence = object.label == 0
                 ? config.person_confidence_threshold
                 : (animal_class(object.label)
-                       ? config.animal_confidence_threshold
+                       ? (object.label == 80
+                              ? config.wildlife_confidence_threshold
+                              : config.animal_confidence_threshold)
                        : config.confidence_threshold);
             if (object.prob < required_confidence) {
                 continue;
@@ -1298,7 +1834,12 @@ void inference_loop() {
                     : (inside_mailbox ? cv::Scalar(0, 185, 255)
                                       : cv::Scalar(210, 80, 210));
                 std::ostringstream label;
-                label << "animal " << class_name(object.label) << " " << std::fixed
+                if (object.label == 80) {
+                    label << "wildlife ";
+                } else {
+                    label << "animal " << class_name(object.label) << " ";
+                }
+                label << std::fixed
                       << std::setprecision(0) << object.prob * 100.0f << "%";
                 detection_overlays.push_back({object.rect, label.str(), color});
                 continue;
@@ -1590,6 +2131,46 @@ void serve_archived_image(int client_socket, const std::string& archive_director
     send_text(client_socket, "image/jpeg", body);
 }
 
+void serve_manual_capture(int client_socket, const std::string& kind,
+                          const std::string& filename) {
+    if (!manual_storage_ready() || !valid_manual_capture(kind, filename)) {
+        send_text(client_socket, "text/plain", "Not found\n", "404 Not Found");
+        return;
+    }
+    const auto path = manual_directory(kind) / filename;
+    std::ifstream file(path, std::ios::binary);
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (!file || error) {
+        send_text(client_socket, "text/plain", "Not found\n", "404 Not Found");
+        return;
+    }
+    const std::string content_type =
+        kind == "snapshots" ? "image/jpeg" : "video/mp4";
+    std::ostringstream headers;
+    headers << "HTTP/1.1 200 OK\r\n"
+            << "Content-Type: " << content_type << "\r\n"
+            << "Content-Length: " << size << "\r\n"
+            << "Content-Disposition: attachment; filename=\""
+            << filename << "\"\r\n"
+            << "Cache-Control: private, no-store\r\n"
+            << "Connection: close\r\n\r\n";
+    const std::string header_text = headers.str();
+    if (!send_all(client_socket, header_text.data(), header_text.size())) {
+        return;
+    }
+    std::array<char, 65536> buffer{};
+    while (file) {
+        file.read(buffer.data(), buffer.size());
+        const auto bytes = file.gcount();
+        if (bytes <= 0 ||
+            !send_all(client_socket, buffer.data(),
+                      static_cast<std::size_t>(bytes))) {
+            break;
+        }
+    }
+}
+
 void handle_client(int client_socket) {
     timeval timeout{};
     timeout.tv_sec = 5;
@@ -1674,6 +2255,61 @@ void handle_client(int client_socket) {
                       "{\"error\":\"The original boundaries could not be restored.\"}",
                       "500 Internal Server Error");
         }
+    } else if (method == "POST" && path == "/api/manual/snapshots") {
+        int count = 1;
+        const auto values = parse_form(query);
+        const auto count_value = values.find("count");
+        if (count_value != values.end()) {
+            try {
+                count = std::stoi(count_value->second);
+            } catch (...) {
+                count = 1;
+            }
+        }
+        std::string error_message;
+        const int saved = save_manual_snapshots(count, error_message);
+        if (saved > 0) {
+            send_text(client_socket, "application/json",
+                      "{\"saved\":" + std::to_string(saved) + "}");
+        } else {
+            send_text(client_socket, "application/json",
+                      "{\"error\":\"" + json_escape(error_message) + "\"}",
+                      "503 Service Unavailable");
+        }
+    } else if (method == "POST" &&
+               path == "/api/manual/recordings/start") {
+        std::string error_message;
+        if (start_manual_recording(error_message)) {
+            send_text(client_socket, "application/json", "{\"started\":true}");
+        } else {
+            send_text(client_socket, "application/json",
+                      "{\"error\":\"" + json_escape(error_message) + "\"}",
+                      "409 Conflict");
+        }
+    } else if (method == "POST" &&
+               path == "/api/manual/recordings/stop") {
+        std::string error_message;
+        if (stop_manual_recording(error_message)) {
+            send_text(client_socket, "application/json", "{\"stopping\":true}");
+        } else {
+            send_text(client_socket, "application/json",
+                      "{\"error\":\"" + json_escape(error_message) + "\"}",
+                      "409 Conflict");
+        }
+    } else if (method == "DELETE" &&
+               path.rfind("/api/manual-captures/", 0) == 0) {
+        const std::string remainder =
+            path.substr(std::strlen("/api/manual-captures/"));
+        const std::size_t separator = remainder.find('/');
+        const std::string kind = remainder.substr(0, separator);
+        const std::string filename = separator == std::string::npos
+            ? std::string{} : remainder.substr(separator + 1);
+        if (delete_manual_capture(kind, filename)) {
+            send_text(client_socket, "application/json", "{\"deleted\":true}");
+        } else {
+            send_text(client_socket, "application/json", "{\"deleted\":false}",
+                      "404 Not Found");
+        }
     } else if (method == "DELETE" && path.rfind("/api/road-events/", 0) == 0) {
         const std::string event_id = path.substr(std::strlen("/api/road-events/"));
         if (delete_road_event(event_id)) {
@@ -1701,6 +2337,8 @@ void handle_client(int client_socket) {
         send_text(client_socket, "application/json", events_json());
     } else if (path == "/api/road-events") {
         send_text(client_socket, "application/json", road_events_json());
+    } else if (path == "/api/manual-captures") {
+        send_text(client_socket, "application/json", manual_captures_json());
     } else if (path == "/api/zones") {
         send_text(client_socket, "application/json", zones_json());
     } else if (path == "/stream.mjpg") {
@@ -1711,6 +2349,14 @@ void handle_client(int client_socket) {
     } else if (path.rfind("/road-events/", 0) == 0) {
         const std::string filename = path.substr(std::strlen("/road-events/"));
         serve_archived_image(client_socket, "road_events", filename);
+    } else if (path.rfind("/manual/", 0) == 0) {
+        const std::string remainder =
+            path.substr(std::strlen("/manual/"));
+        const std::size_t separator = remainder.find('/');
+        const std::string kind = remainder.substr(0, separator);
+        const std::string filename = separator == std::string::npos
+            ? std::string{} : remainder.substr(separator + 1);
+        serve_manual_capture(client_socket, kind, filename);
     } else if (path == "/favicon.ico") {
         send_text(client_socket, "text/plain", "", "204 No Content");
     } else {
@@ -1763,6 +2409,7 @@ int web_loop(int port) {
 int main(int argc, char** argv) {
     const char* camera_env = std::getenv("CAMERA_URL");
     const std::string camera_url = camera_env ? camera_env : "";
+    config.camera_url = camera_url;
     config.driveway_zone = parse_zone(std::getenv("DRIVEWAY_ZONE"));
     config.mailbox_zone = parse_optional_zone(std::getenv("MAILBOX_ZONE"));
     config.road_zone = parse_optional_zone(std::getenv("ROAD_ZONE"));
@@ -1790,10 +2437,38 @@ int main(int argc, char** argv) {
         environment_number("PERSON_CONFIDENCE_THRESHOLD", 0.25), 0.01, 0.99));
     config.animal_confidence_threshold = static_cast<float>(std::clamp(
         environment_number("ANIMAL_CONFIDENCE_THRESHOLD", 0.35), 0.01, 0.99));
+    config.animal_alerts_enabled =
+        environment_flag("ANIMAL_ALERTS_ENABLED", true);
+    config.wildlife_confidence_threshold = static_cast<float>(std::clamp(
+        environment_number("WILDLIFE_CONFIDENCE_THRESHOLD", 0.20), 0.01, 0.99));
     config.nms_threshold = static_cast<float>(std::clamp(
         environment_number("NMS_THRESHOLD", 0.50), 0.01, 0.99));
     config.detection_fps = std::clamp(
         environment_number("DETECTION_FPS", 5.0), 1.0, 15.0);
+    config.wildlife_model_enabled =
+        environment_flag("WILDLIFE_MODEL_ENABLED", false);
+    config.wildlife_detection_fps = std::clamp(
+        environment_number("WILDLIFE_DETECTION_FPS", 1.0), 0.2, 5.0);
+    const char* wildlife_param_env = std::getenv("WILDLIFE_PARAM_PATH");
+    const char* wildlife_model_env = std::getenv("WILDLIFE_MODEL_PATH");
+    if (wildlife_param_env && *wildlife_param_env) {
+        config.wildlife_param_path = wildlife_param_env;
+    }
+    if (wildlife_model_env && *wildlife_model_env) {
+        config.wildlife_model_path = wildlife_model_env;
+    }
+    const char* manual_storage_env = std::getenv("MANUAL_STORAGE_ROOT");
+    if (manual_storage_env && *manual_storage_env) {
+        config.manual_storage_root = manual_storage_env;
+    }
+    config.manual_recording_seconds = std::clamp(
+        environment_number("MANUAL_RECORDING_SECONDS", 30.0), 5.0, 3600.0);
+    config.manual_storage_max_gb = std::max(
+        1.0, environment_number("MANUAL_STORAGE_MAX_GB", 200.0));
+    config.manual_storage_min_free_gb = std::max(
+        1.0, environment_number("MANUAL_STORAGE_MIN_FREE_GB", 10.0));
+    config.reconnect_delay_seconds = std::clamp(
+        environment_number("RECONNECT_DELAY_SECONDS", 2.0), 0.1, 60.0);
     const char* output_env = std::getenv("OUTPUT_DIR");
     config.output_dir = output_env && *output_env ? output_env : "runtime";
     config.snapshot_retention = static_cast<std::size_t>(std::max(
@@ -1814,6 +2489,11 @@ int main(int argc, char** argv) {
     default_zones = current_zones_locked();
     std::filesystem::create_directories(config.output_dir / "events");
     std::filesystem::create_directories(config.output_dir / "road_events");
+    if (manual_storage_ready()) {
+        std::filesystem::create_directories(manual_directory("snapshots"));
+        std::filesystem::create_directories(manual_directory("videos"));
+        enforce_manual_retention();
+    }
     load_saved_zones();
     load_existing_events();
 

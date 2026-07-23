@@ -38,22 +38,29 @@ tracking, snapshots, and notifications.
 
 ## Permanent service
 
-The permanent server runs five NCNN detections per second while camera capture
-continues independently. It records the first appearance of each person or
-vehicle class inside `DRIVEWAY_ZONE`, waits until the class has cleared, and
-uses a 60-second per-class cooldown to suppress duplicate alerts. It writes:
+The permanent server runs five general NCNN detections per second while camera
+capture continues independently. It can also run Microsoft's compact
+MegaDetector V6 YOLOv10 wildlife model once per second. If the camera or
+network disconnects, every failed
+RTSP session waits for `RECONNECT_DELAY_SECONDS` before reopening, and
+detection pauses until a genuinely new frame arrives. It records the first
+appearance of each person or vehicle class inside `DRIVEWAY_ZONE`, waits until
+the class has cleared, and uses a 60-second per-class cooldown to suppress
+duplicate alerts. It writes:
 
 - annotated JPEG snapshots to `runtime/events/`;
 - a durable `runtime/events.csv` log;
 - the newest events to the dashboard at `http://PI_ADDRESS:8000/`.
 - optional text-only ntfy phone alerts for accepted events, using the same
   cooldown as the event log.
-- animal alerts from any configured boundary, grouped under one cooldown while
-  retaining the model's best supported species guess in the event name.
+- wildlife alerts from any configured boundary, grouped under one cooldown.
 - an optional amber mailbox zone that only records a vehicle after it remains
   nearly stationary for a configured dwell period.
 - full-screen event viewing and confirmed deletion of both the snapshot and its
   history row from the dashboard.
+- manual snapshots and 30-second native-stream video recordings on the
+  separate recording SSD, with a local gallery, download links, deletion, and
+  free-space/retention protection.
 - a separate no-alert road-traffic archive that tracks passing vehicles and
   saves one snapshot per track, with its own retention limit and gallery tab.
 
@@ -64,13 +71,37 @@ private `.env` file and are not embedded in the executable or service unit.
 The ntfy topic is also stored only in that private file. Set `NTFY_SERVER` and
 `NTFY_TOPIC` to enable alerts; snapshots remain local to the Pi.
 
-Person detections use a 0.25 confidence threshold, animals default to 0.35,
-and vehicles retain the 0.40 threshold. Zone entry is evaluated at the
+Person detections use a 0.25 confidence threshold, MegaDetector wildlife
+detections default to 0.20, and vehicles retain the 0.40 threshold. Zone entry
+is evaluated at the
 bottom-center of each box (the person's feet or object's contact point), which
-is more appropriate for a driveway boundary than the box center. The standard
-COCO model has no dedicated deer class, so deer may be reported as a similar
-supported animal or missed. Zebra and giraffe detections are ignored because
-those classes produced repeatable flag false positives in the reference view.
+is more appropriate for a driveway boundary than the box center.
+
+### Optional MegaDetector V6 wildlife model
+
+The wildlife pass uses `MDV6-yolov10-c`, a 2.3-million-parameter camera-trap
+model with animal, person, and vehicle categories. The service consumes only
+its animal output; the existing YOLOv8n detector remains responsible for
+people and detailed vehicle classes.
+
+The model is not committed to this repository. Export the official
+`MDV6-yolov10-c.pt` weight with Ultralytics 8.4.104:
+
+```sh
+yolo export model=MDV6-yolov10-c.pt format=ncnn imgsz=640 device=cpu
+mkdir -p wildlife-model
+cp MDV6-yolov10-c_ncnn_model/model.ncnn.param wildlife-model/
+cp MDV6-yolov10-c_ncnn_model/model.ncnn.bin wildlife-model/
+```
+
+Then set `WILDLIFE_MODEL_ENABLED=true`. `WILDLIFE_DETECTION_FPS=1` is the
+recommended Pi 5 starting point. The status API and dashboard show whether the
+model loaded and its most recent inference time. The weight and Ultralytics
+export are AGPL-3.0 licensed; the project-authored integration remains MIT.
+
+MegaDetector detects wildlife but does not name species. A later classifier
+can consume only accepted animal snapshots on a second Pi, preserving the
+camera Pi's live-stream performance and local-only image handling.
 
 Planned dashboard improvement: editable zone handles over the live image with
 Preview, Save, and Cancel controls, so the homeowner can redraw the boundary

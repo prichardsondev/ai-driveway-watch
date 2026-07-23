@@ -27,9 +27,19 @@ target_compile_options(driveway_ncnn_benchmark PRIVATE -O3)
 
 add_executable(driveway_ncnn_server
     server.cpp
+    wildlifeDetector.cpp
     yoloV8.cpp
 )
 
 target_include_directories(driveway_ncnn_server PRIVATE ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(driveway_ncnn_server PRIVATE ${OpenCV_LIBS} ncnn Threads::Threads)
 target_compile_options(driveway_ncnn_server PRIVATE -O3)
+
+add_executable(wildlife_ncnn_benchmark
+    wildlife_benchmark.cpp
+    wildlifeDetector.cpp
+)
+
+target_include_directories(wildlife_ncnn_benchmark PRIVATE ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(wildlife_ncnn_benchmark PRIVATE ${OpenCV_LIBS} ncnn)
+target_compile_options(wildlife_ncnn_benchmark PRIVATE -O3)
