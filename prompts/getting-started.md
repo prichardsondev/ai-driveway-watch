@@ -1,15 +1,13 @@
-# Prompt: get started with AI Driveway Watch
+# AI Driveway Watch: beginner setup
 
-I want to set up AI Driveway Watch from this repository on my Raspberry Pi.
+## What you need
 
 Start by checking whether the repository is already present. If it is not,
 clone it from:
 
 `https://github.com/prichardsondev/ai-driveway-watch`
 
-## Before you start: make sure you have these things
-
-Make sure you have the following ready before asking the agent to begin:
+Make sure you have these items ready before starting:
 
 - A Raspberry Pi (Pi 5 recommended) with Raspberry Pi OS, power, and network
   access.
@@ -21,10 +19,15 @@ Make sure you have the following ready before asking the agent to begin:
 - The camera's local username and password, kept private and entered only on
   the Pi when prompted.
 
-If you do not have every item yet, tell the AI assistant what you do have. The
-assistant should explain what can be tested safely before continuing. Do not
-buy hardware or format storage without first confirming the exact model and
-disk.
+If you do not have everything yet, that is okay. Ask the AI assistant what can
+be tested safely with the equipment you have. Do not buy hardware or format
+storage without first confirming the exact model and disk.
+
+## Single prompt to give your AI agent
+
+Copy and paste everything below as one prompt:
+
+I want to set up AI Driveway Watch from this repository on my Raspberry Pi.
 
 Then walk me through the setup one step at a time. Do not assume I already
 know Linux, Raspberry Pi services, OpenCV, NCNN, RTSP, or Tailscale. Pause for
