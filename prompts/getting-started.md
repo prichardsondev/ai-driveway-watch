@@ -7,6 +7,24 @@ clone it from:
 
 `https://github.com/prichardsondev/ai-driveway-watch`
 
+## What you need before starting
+
+Have these items ready:
+
+- A Raspberry Pi (Pi 5 recommended) with Raspberry Pi OS, power, and network
+  access.
+- A PoE-capable camera, a PoE injector or PoE switch, and an Ethernet cable.
+  The camera and Pi should be on the same local network during setup.
+- A laptop or desktop on that network so you can open the dashboard and run
+  setup commands.
+- Optional but recommended: a USB 3 SSD for saved snapshots and recordings.
+- The camera's local username and password, kept private and entered only on
+  the Pi when prompted.
+
+If you do not have every item yet, tell me what you do have and I will explain
+what can be tested safely before we continue. Do not buy hardware or format
+storage without first confirming the exact model and disk.
+
 Then walk me through the setup one step at a time. Do not assume I already
 know Linux, Raspberry Pi services, OpenCV, NCNN, RTSP, or Tailscale. Pause for
 my confirmation after any physical action, reboot, format, camera setting, or
