@@ -7,5 +7,6 @@ ntfy topic, event image, or household identifier into a public chat or issue.
 - [Calibrate zones](calibrate-zones.md)
 - [Diagnose missed detections](diagnose-missed-detections.md)
 - [Add a notification integration](add-notification-integration.md)
+- [Get started from a fresh checkout](getting-started.md)
 
 The repository’s [AGENTS.md](../AGENTS.md) remains authoritative.

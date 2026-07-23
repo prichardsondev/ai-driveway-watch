@@ -30,6 +30,7 @@ The optional, plain-language starter prompts are collected here:
 - [Calibrate camera zones](prompts/calibrate-zones.md)
 - [Diagnose a missed detection](prompts/diagnose-missed-detections.md)
 - [Add a notification integration](prompts/add-notification-integration.md)
+- [Get started from a fresh checkout](prompts/getting-started.md)
 
 `AGENTS.md` is the contributor and deployment safety guide; it is not required
 for normal camera use. The prompts above are the practical starting points for
